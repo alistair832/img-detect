@@ -1,3 +1,5 @@
+from pathlib import Path
+import ast
 import base64
 import zlib
 from collections import Counter, deque
@@ -10,28 +12,39 @@ from streamlit_webrtc import webrtc_streamer
 
 
 st.set_page_config(
-    page_title="Live Fruit Detection",
+    page_title="Fruit Detection",
     page_icon="🍎",
     layout="wide",
 )
 
 # -----------------------------------------------------------------------------
-# Trained from the user's uploaded Fruit Quality Classification YOLO dataset.
-# The original 14 quality labels were merged into 6 fruit categories:
-# Apple, Banana, Guava, Lime, Orange and Pomegranate.
-#
-# The compact model is a Linear SVM trained on HSV colour histograms + low-
-# resolution spatial RGB features. It is embedded here so Streamlit Cloud does
-# not need TensorFlow, PyTorch or a separate model download.
+# Model
 # -----------------------------------------------------------------------------
+# The working embedded model from the previous version is preserved in
+# legacy_model.py. We read only its MODEL_B85 constant, so the old Streamlit UI
+# is never executed.
 CLASSES = ["Apple", "Banana", "Guava", "Lime", "Orange", "Pomegranate"]
 FEATURE_DIM = 164
-MODEL_B85 = """c-jq=X<St00>%j~!39A=L&#x<8JL;#p5;C7Szc0zRFv@M@^eFR*R-3$b;0zyYwlaAxS$Lo+id5YIcMg~FrYx)+|4pg%^RkrX`$WRE!-|&p5OC)c>W)r4^OVGgj{8gbY(I50L66|pVg&1##WvIr;RbSIr6K}dbbqb;%>BMx(`*PSgspaI_GKk(@$0mx0$?y$qCNUL_^wzUhC6N0g{Tan^JcjTq+UdTxq5&)oOFiwTv}}T;H3sj3Id<QRr&6UuPo9VicPt%KsN!LuW`Pcax#kKZux{eD2^XCRO#ZvGO!;3p3H(Lwm`1y$h8DCc)j2ZE%(mv*i>vpbbF3*Zs;3Ew|`Pm?WV`oe?wzy9wQa1FY3+Y)Q%^VuQ5RQOUOXlB|nJN?9TE+#qQ$6B{U{Wi=08^Is-Qm^n<qbJTw=xrjNa16Ed6!qe1gEzG8C<E+^9H|_WCv9a3P&o?N$IkRsBeN*m3EN~V(_5-Lb^iEBSk`jpXzIFT4m=c)aiSlRgZA=t+#FW)FXp*Z*5*XDQ;l2<o2pBBO<;N*E%Acb~^#u5`=PvLS$PN6@os52m6;wyK0o|@n0E^kn;JRZcD5DQEg<&Q%1D_EJ_?`Uw+-~j!a{#TP@($Tt4}50d`9MSH+t8v=Gu7&zrTmG1v}fp#sgVAyy#OsQ?F6adQ%||tH)E{)f^OutD?Pw8<%+*ryTn0pf&88E1H(O`IjytpkX9NhU_IzT1!A6R4{P&TC)=oH%2sZr+n|oo){#41cWdI%5qb~|=)cyO+?yyyC-GCy`*0{z5G?X#bNR|;zM7e!x56WyF4(LrlfOXy;A<)ynjK8#T>MY$rn*>Rj6RMR%^9JQ@&Nybut_cC?@6gJmv^9M<Gi{!gN?hv+;w*jlyQq~P>W<D1%RF$x<vM_(o|TLbm)!rOgSR>rn{nRAh^iWRb}O0+z-)JwT75PerYXJ^Xw<QAas;0qdFu{hcBi5Oct?*FnWHq4|6fXM0x}?!)K7DTHrFY#eRUQq}F&ySB!RBBEy4BiJmU-cw%Lu?EVZ?!9LO~%}#d%M)x)P2WhgkNa@JU*DrCyRFg%Zo`c3pn|ep;$`;A>=B2?@W{A+QdLf(>+Qv4J_|2(-SeQqjHa~=hYG++MH<4uUa(T4+wf;Kwg7Nq|N((?ToFtDk=IixBp~@mbb|sBbyU;@e&(zPkFgefl8<pt0B^6rd`}*rXv6xute?g{LMygr1%|bVJu(DYSn@3B1;1kxQ$8!BWLGw}9Qpw7cm@H_uLMSESwYYEX-V|r`YG0({uN~`~Ltd=V$O!9S=FY(^^&WSutV;YC?o(6w_3&2RHQRdXuH;s3cs<gs^y`&XV4G_&dCB#W@vMD0Il%g}Yp0v!D*0%}0NrQ?n+TKPc`C~K%D&Fi*5|(Ku0p8gp*ZOTdjRAxC&9kJ2LD#(W2o?l)rsnpw4m}jn=0j@eE)0+^$B1+za+Q@ZKmck9fJMp{uUhk0dA6xbTe9(I$fIT>JG<H5B2eQXmAKSIJ}qpgx{%+SL>B0DCW%v2X{HAz%8&@n`|l9#|yLAMKC*XNi%S5)E)IsT@xtgJ2JIsu78Pr4@)aoxZJR_b}zr#`VLbOevEcN6aH6lnm?7v*Jco9+E8X>MNd@j`j4_h&xN&?GjtY+0VnD4@FVrUe<=vVmO~XVk=@k$sHZ|3=)dOcm0q8|R!&z|P%G5;_=`kN#aJ*zfzr=(j;Dz<`3smo2~uj5kIKu`v(6mXr_u#wo!lZhgPH6p?+(i2>SrC`5k1j0!@Ql%v{nELT|;X7+7>vMOGP!`!Tof$bdmSiNq<s!r2D8h4@Xm(zME=4)Xn%PP@|8M%7r`BAF5FgDQ^+|#WG_Wm8WM0S8zE>lJYh@Qd__pT-oI_l`7j5@-upoHs8C1KU!-DrhuOQX{e_y$Jy0-&2mEdMXi=&m<%n-w8x$y&8vIYF<sb#Za7<%dH!B>x%$H24gXuE;X3^r2$<ohk2>5jO?#{s(kfaTXp>68d2;xH{edes*%Hqu=+TNX;Dyob=8|eAMauz$)xP9aU%9jaMM}Kg!Ed)%!=3bj@(JGoeS~fTw^BFI8&RwHUv(nuDqp7*IhHfGwIVpG<{wrQGm>#p0PH2U+q*LsKxlCw)>SHZk#uE_cY^m+u&uh@^@h7Y`D5Dd^ntdGavlhP<DMzx6ab_%M2YXdenj0)uRs)e*<*tv^quyh!K*^K=W|#JE(KpOcYV*@IjC9v9lfkyl<_h!iaDmnSM=mh)n?Uob={#JS(Cye_*gicz~&iYhcLTtA#Sziv-5((sGIC7|0ZT~cm`F>@N|~`UZ_Ec=dX%F{jtD2bupS#y)Wn|r(?uV3+a9Kam|6o-hXL{@<nw%H-`TtnCo@~Zwe3I*->w)Ym=gd3jg#l6kl^4<BTNbjtdo`_q1joPLHJLf?CF|m+C9!8-gvPCis=M^zglArSWXTZ%3v!IZ!bbMW-<r$id`f+fviPq_fFchGI*bxud~g`XW8f^yAxtVN&m=Uaf}g)Ozb-DA|8XA8F-n(e{h>DnbM+!Cb(CZ3IJHwZ{X(ip-9*0&BgkEAcKk2MWoF<PYE?5Xl|nYH*p1#gTY`fN>XW6Y|>i4Ph3x-~?eDrtxUOij8=IFc|m5nZjHgk6-Ysac3Ohx8WGPhhK$L@oj!Mwqaf<z;XCBVJ+^2Yx(WCRqW62#VukdekYE`llW;k5g+FV;TPg*egXbNT*$A-=frq^D{c}`a@+7@(aO)l-SBqaj_-;gegeKDe##f)^I~7V2>ZoX+)VtFIFcWTBX9%XB9@Au@f7|>+|0j^kBRwwKkO7Ud0RVeBi|~Ph*dn~6JQ1`gkLgU;7PK;`iW^rYIfRJ;1LL0IbtCFGqK!KXDv>NPZ@39WY4C0^XI6i?fd0}D9|0yM3AtzzeWepM&yE5;2F(=Ro1U<x%Qj(Y$6%-1`%W%SOX4$9^^vmIN8Y1+!HjDdyEdCA>0aNLtVH`^euZGZA2Xr!8M_wXcYGY+JxTaW}^P68)rm4&{os|JzyszjPA4FqnRik8MtDUiF$B6qS0~m26_wiLJ=qieaFV5=j^!l+`=}Y708U9qtS>*M^I`z=MUD563`|VwR;ieqgQMt+JVNma~7kI&`b0&8isbYYYut`{Sz^$29+WfMRLbbIZEVe&~DV3Q_vQ40(sDf$bk-`4^S(*(%y*S{ts~fMG*"""
+MODEL_SOURCE_PATH = Path(__file__).resolve().parent / "legacy_model.py"
+
+
+def _read_model_blob() -> str:
+    source = MODEL_SOURCE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "MODEL_B85":
+                    return ast.literal_eval(node.value)
+
+    raise RuntimeError("Embedded fruit model could not be found.")
 
 
 @st.cache_resource
 def load_embedded_model():
-    raw = zlib.decompress(base64.b85decode(MODEL_B85.encode("ascii")))
+    model_b85 = _read_model_blob()
+    raw = zlib.decompress(base64.b85decode(model_b85.encode("ascii")))
     values = np.frombuffer(raw, dtype="<f2").astype(np.float32)
 
     offset = 0
@@ -55,7 +68,6 @@ COEF, INTERCEPT, FEATURE_MEAN, FEATURE_STD = load_embedded_model()
 
 
 def extract_features(image: Image.Image) -> np.ndarray:
-    """Create the same 164 features used to train the compact fruit model."""
     image = image.convert("RGB").resize((64, 64), Image.Resampling.BILINEAR)
     hsv = np.asarray(image.convert("HSV"), dtype=np.uint8)
 
@@ -75,29 +87,103 @@ def extract_features(image: Image.Image) -> np.ndarray:
     return (features - FEATURE_MEAN) / FEATURE_STD
 
 
+def _image_quality_checks(image: Image.Image):
+    """Basic checks that help reject empty/dark/grey camera regions."""
+    hsv = np.asarray(image.convert("RGB").resize((64, 64)).convert("HSV"), dtype=np.float32)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    colourful_fraction = float(np.mean(saturation > 35))
+    mean_brightness = float(np.mean(value))
+    brightness_std = float(np.std(value))
+
+    if mean_brightness < 25:
+        return False, "Image is too dark"
+    if mean_brightness > 248 and brightness_std < 8:
+        return False, "Image is almost blank"
+    if colourful_fraction < 0.06 and brightness_std < 20:
+        return False, "No clear fruit-like object"
+
+    return True, ""
+
+
 def predict_fruit(image: Image.Image):
+    """
+    Return prediction details.
+
+    The percentage is prediction confidence for this image, not the overall
+    validation accuracy of the model.
+    """
     features = extract_features(image)
     scores = COEF @ features + INTERCEPT
-    prediction_index = int(np.argmax(scores))
 
-    # This softmax is only used as a relative live display score. The SVM itself
-    # is not probability-calibrated, so the fruit name is the important output.
-    shifted = scores - scores.max()
+    # Temperature softmax prevents the uncalibrated SVM scores from becoming
+    # artificially close to 100% too easily.
+    temperature = 1.8
+    shifted = (scores - np.max(scores)) / temperature
+    shifted = np.clip(shifted, -50, 50)
     probabilities = np.exp(shifted)
     probabilities /= probabilities.sum() + 1e-8
 
-    return prediction_index, float(probabilities[prediction_index])
+    order = np.argsort(probabilities)[::-1]
+    prediction_index = int(order[0])
+    second_index = int(order[1])
+    confidence = float(probabilities[prediction_index])
+    margin = float(confidence - probabilities[second_index])
+
+    image_ok, image_reason = _image_quality_checks(image)
+
+    # Unknown/rejection logic: do not force every object into one fruit class.
+    is_confident = image_ok and confidence >= 0.46 and margin >= 0.10
+
+    reason = ""
+    if not image_ok:
+        reason = image_reason
+    elif confidence < 0.46:
+        reason = "Low prediction confidence"
+    elif margin < 0.10:
+        reason = "Two fruit classes look too similar"
+
+    return {
+        "index": prediction_index,
+        "fruit": CLASSES[prediction_index],
+        "confidence": confidence,
+        "margin": margin,
+        "probabilities": probabilities,
+        "known": is_confident,
+        "reason": reason,
+    }
 
 
-prediction_history = deque(maxlen=10)
-score_history = deque(maxlen=10)
+def centre_square(image: Image.Image, fraction: float = 0.68) -> Image.Image:
+    image = image.convert("RGB")
+    width, height = image.size
+    size = max(1, int(min(width, height) * fraction))
+    left = max(0, (width - size) // 2)
+    top = max(0, (height - size) // 2)
+    return image.crop((left, top, left + size, top + size))
+
+
+def best_prediction_for_uploaded_image(image: Image.Image):
+    """Try both the full image and a centre crop, then use the stronger result."""
+    candidates = [image.convert("RGB"), centre_square(image)]
+    results = [predict_fruit(candidate) for candidate in candidates]
+
+    confident_results = [result for result in results if result["known"]]
+    if confident_results:
+        return max(confident_results, key=lambda item: item["confidence"])
+    return max(results, key=lambda item: item["confidence"])
+
+
+# -----------------------------------------------------------------------------
+# Live camera
+# -----------------------------------------------------------------------------
+result_history = deque(maxlen=10)
 
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     frame_array = frame.to_ndarray(format="rgb24")
-
-    # Mirror the front camera so it behaves like a normal selfie camera.
-    frame_array = frame_array[:, ::-1].copy()
+    frame_array = frame_array[:, ::-1].copy()  # mirror front camera
     image = Image.fromarray(frame_array)
 
     width, height = image.size
@@ -108,28 +194,34 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     bottom = min(height, top + box_size)
 
     roi = image.crop((left, top, right, bottom))
-    prediction_index, prediction_score = predict_fruit(roi)
-
-    prediction_history.append(prediction_index)
-    score_history.append(prediction_score)
+    result = predict_fruit(roi)
+    result_history.append(result)
 
     draw = ImageDraw.Draw(image)
     draw.rectangle((left, top, right, bottom), outline=(40, 220, 90), width=5)
 
-    if len(prediction_history) < 4:
+    if len(result_history) < 4:
         label = "Analyzing fruit..."
     else:
-        stable_index = Counter(prediction_history).most_common(1)[0][0]
-        stable_votes = prediction_history.count(stable_index)
+        known_results = [item for item in result_history if item["known"]]
 
-        if stable_votes >= 5:
-            label = f"Detected: {CLASSES[stable_index]}"
+        if len(known_results) >= 5:
+            stable_index = Counter(item["index"] for item in known_results).most_common(1)[0][0]
+            matching = [item for item in known_results if item["index"] == stable_index]
+
+            if len(matching) >= 5:
+                avg_confidence = float(np.mean([item["confidence"] for item in matching]))
+                label = f"{CLASSES[stable_index]} - {avg_confidence * 100:.1f}% confidence"
+            else:
+                label = "Hold fruit steady in the box"
         else:
-            label = "Hold fruit steady in the box"
+            best_guess = max(result_history, key=lambda item: item["confidence"])
+            label = f"Unknown / not confident - {best_guess['confidence'] * 100:.1f}%"
 
-    text_box = (12, 12, min(width - 12, 370), 62)
+    text_width = min(width - 12, 500)
+    text_box = (12, 12, text_width, 66)
     draw.rounded_rectangle(text_box, radius=12, fill=(0, 0, 0))
-    draw.text((25, 28), label, fill=(255, 255, 255))
+    draw.text((25, 30), label, fill=(255, 255, 255))
 
     guide_text = "Place ONE fruit inside the green box"
     guide_box = (left, max(0, bottom - 36), right, bottom)
@@ -139,10 +231,13 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     return av.VideoFrame.from_ndarray(np.asarray(image), format="rgb24")
 
 
-st.title("🍎 Live Fruit Detection")
+# -----------------------------------------------------------------------------
+# Streamlit UI
+# -----------------------------------------------------------------------------
+st.title("🍎 Fruit Detection")
 st.write(
-    "Turn on your front camera, hold one fruit inside the green box, and the system "
-    "will continuously identify the fruit on the video."
+    "Detect fruit using your front camera or upload a picture. The result includes "
+    "a confidence percentage and rejects uncertain images as Unknown."
 )
 
 info1, info2, info3 = st.columns(3)
@@ -151,40 +246,95 @@ with info1:
 with info2:
     st.metric("Training crops", "2,009")
 with info3:
-    st.metric("Validation accuracy", "66.7%")
+    st.metric("Model validation accuracy", "66.7%")
 
 with st.expander("Supported fruit classes"):
     st.write("Apple • Banana • Guava • Lime • Orange • Pomegranate")
+    st.caption(
+        "The percentage beside a scan is prediction confidence. The 66.7% value above "
+        "is the model's validation accuracy across the supplied dataset."
+    )
 
-st.subheader("Live Front Camera")
-st.caption(
-    "Click START, allow camera permission, then hold one fruit close to the camera "
-    "inside the green square. Keep the fruit steady for about a second."
-)
+camera_tab, upload_tab = st.tabs(["🎥 Live Front Camera", "🖼️ Upload Picture"])
 
-webrtc_streamer(
-    key="live-fruit-camera",
-    video_frame_callback=video_frame_callback,
-    media_stream_constraints={
-        "video": {
-            "facingMode": "user",
-            "width": {"ideal": 640},
-            "height": {"ideal": 480},
+with camera_tab:
+    st.subheader("Live Front Camera")
+    st.caption(
+        "Click START, allow camera permission, then hold one fruit inside the green "
+        "square. The fruit name and confidence update continuously."
+    )
+
+    webrtc_streamer(
+        key="live-fruit-camera",
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={
+            "video": {
+                "facingMode": "user",
+                "width": {"ideal": 640},
+                "height": {"ideal": 480},
+            },
+            "audio": False,
         },
-        "audio": False,
-    },
-    rtc_configuration={
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-    },
-    async_processing=True,
-)
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        },
+        async_processing=True,
+    )
 
-st.info(
-    "For the best result, use good lighting and let the fruit occupy most of the green box. "
-    "This version identifies the fruit type; the original dataset also contains good/bad quality labels."
-)
+    st.info(
+        "If the camera sees an unrelated object or the model is unsure, it will show "
+        "Unknown / not confident instead of forcing a fruit label."
+    )
+
+with upload_tab:
+    st.subheader("Upload a Fruit Picture")
+    st.caption(
+        "Use this when you do not have the real fruit available. For best results, "
+        "choose a clear image with one main fruit near the centre."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Choose JPG, JPEG, PNG, or WEBP",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="fruit-image-upload",
+    )
+
+    if uploaded_file is not None:
+        try:
+            uploaded_image = Image.open(uploaded_file).convert("RGB")
+            result = best_prediction_for_uploaded_image(uploaded_image)
+
+            image_col, result_col = st.columns([1, 1])
+
+            with image_col:
+                st.image(uploaded_image, caption="Uploaded image", use_container_width=True)
+
+            with result_col:
+                if result["known"]:
+                    st.success(f"Detected fruit: **{result['fruit']}**")
+                    st.metric("Prediction confidence", f"{result['confidence'] * 100:.1f}%")
+                else:
+                    st.warning("Result: **Unknown / not confident**")
+                    st.metric(
+                        f"Best guess: {result['fruit']}",
+                        f"{result['confidence'] * 100:.1f}%",
+                    )
+                    if result["reason"]:
+                        st.caption(result["reason"])
+
+                st.subheader("Top 3 predictions")
+                order = np.argsort(result["probabilities"])[::-1][:3]
+                for index in order:
+                    score = float(result["probabilities"][index])
+                    st.write(f"**{CLASSES[int(index)]}** — {score * 100:.1f}%")
+                    st.progress(min(max(score, 0.0), 1.0))
+
+        except Exception as exc:
+            st.error(f"Could not process this picture: {exc}")
+    else:
+        st.info("Upload a fruit picture to test the model without using the camera.")
 
 st.divider()
 st.caption(
-    "Artificial Intelligence project — live fruit recognition trained from the supplied fruit dataset."
+    "Artificial Intelligence project — fruit recognition trained from the supplied fruit dataset."
 )
