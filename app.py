@@ -1,7 +1,6 @@
 from pathlib import Path
-import ast
+from io import BytesIO
 import base64
-import zlib
 from collections import Counter, deque
 
 import av
@@ -18,78 +17,98 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# Model
+# Upgraded compact model
 # -----------------------------------------------------------------------------
-# The working embedded model from the previous version is preserved in
-# legacy_model.py. We read only its MODEL_B85 constant, so the old Streamlit UI
-# is never executed.
+# Trained from the user's supplied YOLO fruit dataset. The original quality
+# labels are merged into six fruit types for this application.
 CLASSES = ["Apple", "Banana", "Guava", "Lime", "Orange", "Pomegranate"]
-FEATURE_DIM = 164
-MODEL_SOURCE_PATH = Path(__file__).resolve().parent / "legacy_model.py"
+MODEL_VALIDATION_ACCURACY = 80.3
+TRAINING_CROPS = 2120
+APP_DIR = Path(__file__).resolve().parent
+MODEL_PART_DIR = APP_DIR / "model_data"
+MODEL_PARTS = [MODEL_PART_DIR / f"hgb80_{i:02d}.txt" for i in range(9)]
 
 
-def _read_model_blob() -> str:
-    source = MODEL_SOURCE_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(source)
+@st.cache_resource(show_spinner="Loading upgraded fruit model...")
+def load_model():
+    missing = [path.name for path in MODEL_PARTS if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Upgraded model data is incomplete. Missing: " + ", ".join(missing)
+        )
 
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "MODEL_B85":
-                    return ast.literal_eval(node.value)
+    encoded = "".join(path.read_text(encoding="utf-8").strip() for path in MODEL_PARTS)
+    raw = base64.b85decode(encoded.encode("ascii"))
 
-    raise RuntimeError("Embedded fruit model could not be found.")
+    with np.load(BytesIO(raw), allow_pickle=False) as pack:
+        nodes = pack["nodes"].copy()
+        roots = pack["roots"].copy()
+        tree_classes = pack["classes"].copy()
+        baseline = pack["baseline"].astype(np.float32).copy()
 
-
-@st.cache_resource
-def load_embedded_model():
-    model_b85 = _read_model_blob()
-    raw = zlib.decompress(base64.b85decode(model_b85.encode("ascii")))
-    values = np.frombuffer(raw, dtype="<f2").astype(np.float32)
-
-    offset = 0
-    coef_count = len(CLASSES) * FEATURE_DIM
-    coef = values[offset : offset + coef_count].reshape(len(CLASSES), FEATURE_DIM)
-    offset += coef_count
-
-    intercept = values[offset : offset + len(CLASSES)]
-    offset += len(CLASSES)
-
-    mean = values[offset : offset + FEATURE_DIM]
-    offset += FEATURE_DIM
-
-    std = values[offset : offset + FEATURE_DIM]
-    std = np.where(std == 0, 1.0, std)
-
-    return coef, intercept, mean, std
+    return nodes, roots, tree_classes, baseline
 
 
-COEF, INTERCEPT, FEATURE_MEAN, FEATURE_STD = load_embedded_model()
+NODES, ROOTS, TREE_CLASSES, BASELINE = load_model()
+
+
+def _normalised_histogram(channel: np.ndarray, bins: int) -> np.ndarray:
+    histogram, _ = np.histogram(channel, bins=bins, range=(0, 256))
+    histogram = histogram.astype(np.float32)
+    histogram /= histogram.sum() + 1e-8
+    return histogram
 
 
 def extract_features(image: Image.Image) -> np.ndarray:
-    image = image.convert("RGB").resize((64, 64), Image.Resampling.BILINEAR)
+    """Extract the same 304 colour/spatial features used by the upgraded model."""
+    image = image.convert("RGB").resize((96, 96), Image.Resampling.BILINEAR)
+
     hsv = np.asarray(image.convert("HSV"), dtype=np.uint8)
+    ycbcr = np.asarray(image.convert("YCbCr"), dtype=np.uint8)
 
-    feature_parts = []
-    for channel, bins in ((0, 24), (1, 16), (2, 16)):
-        histogram, _ = np.histogram(hsv[:, :, channel], bins=bins, range=(0, 256))
-        histogram = histogram.astype(np.float32)
-        histogram /= histogram.sum() + 1e-8
-        feature_parts.append(histogram)
+    parts = [
+        _normalised_histogram(hsv[:, :, 0], 32),
+        _normalised_histogram(hsv[:, :, 1], 24),
+        _normalised_histogram(hsv[:, :, 2], 24),
+        _normalised_histogram(ycbcr[:, :, 1], 16),
+        _normalised_histogram(ycbcr[:, :, 2], 16),
+    ]
 
-    small_rgb = np.asarray(
-        image.resize((6, 6), Image.Resampling.BILINEAR), dtype=np.float32
+    spatial_rgb = np.asarray(
+        image.resize((8, 8), Image.Resampling.BILINEAR), dtype=np.float32
     ).reshape(-1) / 255.0
-    feature_parts.append(small_rgb)
+    parts.append(spatial_rgb)
 
-    features = np.concatenate(feature_parts).astype(np.float32)
-    return (features - FEATURE_MEAN) / FEATURE_STD
+    return np.concatenate(parts).astype(np.float32)
+
+
+def model_scores(features: np.ndarray) -> np.ndarray:
+    """Run the compact histogram-gradient-boosting trees using only NumPy."""
+    scores = BASELINE.astype(np.float32).copy()
+
+    for root, class_index in zip(ROOTS, TREE_CLASSES):
+        node_index = int(root)
+
+        while int(NODES["f"][node_index]) >= 0:
+            feature_index = int(NODES["f"][node_index])
+            threshold = float(NODES["t"][node_index])
+
+            if float(features[feature_index]) <= threshold:
+                node_index += int(NODES["l"][node_index])
+            else:
+                node_index += int(NODES["r"][node_index])
+
+        scores[int(class_index)] += float(NODES["v"][node_index])
+
+    return scores
 
 
 def _image_quality_checks(image: Image.Image):
-    """Basic checks that help reject empty/dark/grey camera regions."""
-    hsv = np.asarray(image.convert("RGB").resize((64, 64)).convert("HSV"), dtype=np.float32)
+    """Reject obviously blank, dark, or low-information regions."""
+    hsv = np.asarray(
+        image.convert("RGB").resize((64, 64), Image.Resampling.BILINEAR).convert("HSV"),
+        dtype=np.float32,
+    )
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
 
@@ -101,25 +120,19 @@ def _image_quality_checks(image: Image.Image):
         return False, "Image is too dark"
     if mean_brightness > 248 and brightness_std < 8:
         return False, "Image is almost blank"
-    if colourful_fraction < 0.06 and brightness_std < 20:
+    if colourful_fraction < 0.05 and brightness_std < 18:
         return False, "No clear fruit-like object"
 
     return True, ""
 
 
 def predict_fruit(image: Image.Image):
-    """
-    Return prediction details.
-
-    The percentage is prediction confidence for this image, not the overall
-    validation accuracy of the model.
-    """
     features = extract_features(image)
-    scores = COEF @ features + INTERCEPT
+    scores = model_scores(features)
 
-    # Temperature softmax prevents the uncalibrated SVM scores from becoming
-    # artificially close to 100% too easily.
-    temperature = 1.8
+    # A mild temperature keeps the displayed confidence from becoming
+    # unrealistically close to 100% for ambiguous samples.
+    temperature = 1.25
     shifted = (scores - np.max(scores)) / temperature
     shifted = np.clip(shifted, -50, 50)
     probabilities = np.exp(shifted)
@@ -132,16 +145,14 @@ def predict_fruit(image: Image.Image):
     margin = float(confidence - probabilities[second_index])
 
     image_ok, image_reason = _image_quality_checks(image)
-
-    # Unknown/rejection logic: do not force every object into one fruit class.
-    is_confident = image_ok and confidence >= 0.46 and margin >= 0.10
+    is_confident = image_ok and confidence >= 0.42 and margin >= 0.07
 
     reason = ""
     if not image_ok:
         reason = image_reason
-    elif confidence < 0.46:
+    elif confidence < 0.42:
         reason = "Low prediction confidence"
-    elif margin < 0.10:
+    elif margin < 0.07:
         reason = "Two fruit classes look too similar"
 
     return {
@@ -155,7 +166,7 @@ def predict_fruit(image: Image.Image):
     }
 
 
-def centre_square(image: Image.Image, fraction: float = 0.68) -> Image.Image:
+def centre_square(image: Image.Image, fraction: float) -> Image.Image:
     image = image.convert("RGB")
     width, height = image.size
     size = max(1, int(min(width, height) * fraction))
@@ -165,8 +176,12 @@ def centre_square(image: Image.Image, fraction: float = 0.68) -> Image.Image:
 
 
 def best_prediction_for_uploaded_image(image: Image.Image):
-    """Try both the full image and a centre crop, then use the stronger result."""
-    candidates = [image.convert("RGB"), centre_square(image)]
+    """Try several centre crops because training samples use annotated fruit boxes."""
+    candidates = [
+        image.convert("RGB"),
+        centre_square(image, 0.82),
+        centre_square(image, 0.68),
+    ]
     results = [predict_fruit(candidate) for candidate in candidates]
 
     confident_results = [result for result in results if result["known"]]
@@ -178,12 +193,12 @@ def best_prediction_for_uploaded_image(image: Image.Image):
 # -----------------------------------------------------------------------------
 # Live camera
 # -----------------------------------------------------------------------------
-result_history = deque(maxlen=10)
+result_history = deque(maxlen=12)
 
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     frame_array = frame.to_ndarray(format="rgb24")
-    frame_array = frame_array[:, ::-1].copy()  # mirror front camera
+    frame_array = frame_array[:, ::-1].copy()
     image = Image.fromarray(frame_array)
 
     width, height = image.size
@@ -200,32 +215,43 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     draw = ImageDraw.Draw(image)
     draw.rectangle((left, top, right, bottom), outline=(40, 220, 90), width=5)
 
-    if len(result_history) < 4:
+    if len(result_history) < 5:
         label = "Analyzing fruit..."
     else:
-        known_results = [item for item in result_history if item["known"]]
+        recent = list(result_history)[-10:]
+        known_results = [item for item in recent if item["known"]]
 
         if len(known_results) >= 5:
-            stable_index = Counter(item["index"] for item in known_results).most_common(1)[0][0]
-            matching = [item for item in known_results if item["index"] == stable_index]
+            stable_index = Counter(
+                item["index"] for item in known_results
+            ).most_common(1)[0][0]
+            matching = [
+                item for item in known_results if item["index"] == stable_index
+            ]
 
             if len(matching) >= 5:
-                avg_confidence = float(np.mean([item["confidence"] for item in matching]))
-                label = f"{CLASSES[stable_index]} - {avg_confidence * 100:.1f}% confidence"
+                avg_confidence = float(
+                    np.mean([item["confidence"] for item in matching[-8:]])
+                )
+                label = (
+                    f"{CLASSES[stable_index]} - "
+                    f"{avg_confidence * 100:.1f}% confidence"
+                )
             else:
                 label = "Hold fruit steady in the box"
         else:
-            best_guess = max(result_history, key=lambda item: item["confidence"])
-            label = f"Unknown / not confident - {best_guess['confidence'] * 100:.1f}%"
+            best_guess = max(recent, key=lambda item: item["confidence"])
+            label = (
+                "Unknown / not confident - "
+                f"{best_guess['confidence'] * 100:.1f}%"
+            )
 
-    text_width = min(width - 12, 500)
-    text_box = (12, 12, text_width, 66)
-    draw.rounded_rectangle(text_box, radius=12, fill=(0, 0, 0))
+    text_width = min(width - 12, 520)
+    draw.rounded_rectangle((12, 12, text_width, 66), radius=12, fill=(0, 0, 0))
     draw.text((25, 30), label, fill=(255, 255, 255))
 
     guide_text = "Place ONE fruit inside the green box"
-    guide_box = (left, max(0, bottom - 36), right, bottom)
-    draw.rectangle(guide_box, fill=(0, 0, 0))
+    draw.rectangle((left, max(0, bottom - 36), right, bottom), fill=(0, 0, 0))
     draw.text((left + 10, max(2, bottom - 26)), guide_text, fill=(255, 255, 255))
 
     return av.VideoFrame.from_ndarray(np.asarray(image), format="rgb24")
@@ -236,23 +262,25 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
 # -----------------------------------------------------------------------------
 st.title("🍎 Fruit Detection")
 st.write(
-    "Detect fruit using your front camera or upload a picture. The result includes "
-    "a confidence percentage and rejects uncertain images as Unknown."
+    "Detect fruit using your front camera or upload a picture. The upgraded model "
+    "uses richer colour and spatial features for better recognition."
 )
 
 info1, info2, info3 = st.columns(3)
 with info1:
     st.metric("Fruit classes", "6")
 with info2:
-    st.metric("Training crops", "2,009")
+    st.metric("Training crops", f"{TRAINING_CROPS:,}")
 with info3:
-    st.metric("Model validation accuracy", "66.7%")
+    st.metric("Model validation accuracy", f"{MODEL_VALIDATION_ACCURACY:.1f}%", "+13.6 pts")
+
+st.success("Model upgraded: validation accuracy improved from 66.7% to 80.3%.")
 
 with st.expander("Supported fruit classes"):
     st.write("Apple • Banana • Guava • Lime • Orange • Pomegranate")
     st.caption(
-        "The percentage beside a scan is prediction confidence. The 66.7% value above "
-        "is the model's validation accuracy across the supplied dataset."
+        "The percentage beside one scan is prediction confidence. The 80.3% value "
+        "above is validation accuracy measured across the supplied validation set."
     )
 
 camera_tab, upload_tab = st.tabs(["🎥 Live Front Camera", "🖼️ Upload Picture"])
@@ -261,11 +289,11 @@ with camera_tab:
     st.subheader("Live Front Camera")
     st.caption(
         "Click START, allow camera permission, then hold one fruit inside the green "
-        "square. The fruit name and confidence update continuously."
+        "square. Good lighting and a fruit that fills most of the box give the best result."
     )
 
     webrtc_streamer(
-        key="live-fruit-camera",
+        key="live-fruit-camera-v2",
         video_frame_callback=video_frame_callback,
         media_stream_constraints={
             "video": {
@@ -282,21 +310,21 @@ with camera_tab:
     )
 
     st.info(
-        "If the camera sees an unrelated object or the model is unsure, it will show "
-        "Unknown / not confident instead of forcing a fruit label."
+        "The prediction is smoothed across several frames. If the model is unsure, "
+        "it shows Unknown / not confident instead of forcing a fruit label."
     )
 
 with upload_tab:
     st.subheader("Upload a Fruit Picture")
     st.caption(
-        "Use this when you do not have the real fruit available. For best results, "
-        "choose a clear image with one main fruit near the centre."
+        "Use this when you do not have a real fruit available. Choose a clear picture "
+        "with one main fruit near the centre."
     )
 
     uploaded_file = st.file_uploader(
         "Choose JPG, JPEG, PNG, or WEBP",
         type=["jpg", "jpeg", "png", "webp"],
-        key="fruit-image-upload",
+        key="fruit-image-upload-v2",
     )
 
     if uploaded_file is not None:
@@ -307,12 +335,19 @@ with upload_tab:
             image_col, result_col = st.columns([1, 1])
 
             with image_col:
-                st.image(uploaded_image, caption="Uploaded image", use_container_width=True)
+                st.image(
+                    uploaded_image,
+                    caption="Uploaded image",
+                    use_container_width=True,
+                )
 
             with result_col:
                 if result["known"]:
                     st.success(f"Detected fruit: **{result['fruit']}**")
-                    st.metric("Prediction confidence", f"{result['confidence'] * 100:.1f}%")
+                    st.metric(
+                        "Prediction confidence",
+                        f"{result['confidence'] * 100:.1f}%",
+                    )
                 else:
                     st.warning("Result: **Unknown / not confident**")
                     st.metric(
@@ -332,7 +367,7 @@ with upload_tab:
         except Exception as exc:
             st.error(f"Could not process this picture: {exc}")
     else:
-        st.info("Upload a fruit picture to test the model without using the camera.")
+        st.info("Upload a fruit picture to test the upgraded model without using the camera.")
 
 st.divider()
 st.caption(
