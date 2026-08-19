@@ -1,5 +1,6 @@
 data/
 outputs/*.npy
 models/*.keras
+!models/best_fruit_model.keras
 __pycache__/
 .ipynb_checkpoints/
