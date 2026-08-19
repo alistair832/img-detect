@@ -47,15 +47,26 @@ if missing_assets:
     )
     st.write(f"Current Python: **{sys.version.split()[0]}**")
     st.markdown(
-        "**Next step:** run `fruits360_full_project/Fruits360_Complete_Assignment_Training.ipynb` "
-        "and place the generated files in `fruits360_full_project/models/`."
+        "**GitHub-first next step:** run the training script, then push the generated "
+        "deployment files back to this repository."
     )
+    st.code(
+        "cd fruits360_full_project\n"
+        "python -m pip install -r requirements-training.txt\n"
+        "python train.py\n",
+        language="bash",
+    )
+    st.markdown("The training script will generate:")
     st.code(
         "models/\n"
         "├── best_fruit_model.keras\n"
         "├── class_names.json\n"
         "└── model_metadata.json",
         language="text",
+    )
+    st.info(
+        "For a short pipeline test first, use `python train.py --quick`. "
+        "Use the normal `python train.py` run for final assignment results."
     )
     st.stop()
 
@@ -72,17 +83,16 @@ if sys.version_info[:2] != (3, 12):
 # version matches the deployment environment used by the training project.
 import tensorflow as tf
 
+
 @st.cache_resource(show_spinner="Loading trained Fruits-360 model...")
 def load_assets():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Missing trained model: {MODEL_PATH}. "
-            "Run Fruits360_Complete_Assignment_Training.ipynb first."
+            f"Missing trained model: {MODEL_PATH}. Run train.py first."
         )
     if not CLASS_NAMES_PATH.exists():
         raise FileNotFoundError(
-            f"Missing class names: {CLASS_NAMES_PATH}. "
-            "Run the training notebook first."
+            f"Missing class names: {CLASS_NAMES_PATH}. Run train.py first."
         )
 
     model = tf.keras.models.load_model(MODEL_PATH, compile=False)
@@ -98,16 +108,18 @@ def load_assets():
     input_w = int(model.input_shape[2])
     return model, class_names, metadata, (input_w, input_h)
 
+
 try:
     model, class_names, metadata, image_size = load_assets()
 except Exception as exc:
     st.title("🍎 Fruits-360 Recognition")
     st.error(str(exc))
     st.info(
-        "Training workflow: open `Fruits360_Complete_Assignment_Training.ipynb`, "
-        "run all cells, and make sure the generated files are inside this app's `models/` folder."
+        "Run `python fruits360_full_project/train.py`, then make sure the generated "
+        "deployment files are inside `fruits360_full_project/models/`."
     )
     st.stop()
+
 
 def predict_image(image: Image.Image, top_k=5):
     image = image.convert("RGB").resize(image_size, Image.Resampling.BILINEAR)
@@ -124,10 +136,12 @@ def predict_image(image: Image.Image, top_k=5):
     ]
     return results
 
+
 prediction_history = deque(maxlen=8)
 confidence_history = deque(maxlen=8)
 frame_counter = 0
 last_label = "Analyzing..."
+
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     global frame_counter, last_label
@@ -185,10 +199,11 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
 
     return av.VideoFrame.from_ndarray(np.asarray(image), format="rgb24")
 
+
 st.title("🍎 Fruits-360 Live Recognition")
 st.write(
     "Use the live front camera or upload a picture. "
-    "The system uses the model exported by the assignment training notebook."
+    "The system uses the model exported by the GitHub-first training script."
 )
 
 m1, m2, m3 = st.columns(3)
