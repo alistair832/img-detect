@@ -1,17 +1,20 @@
 from pathlib import Path
 import json
+import os
 import sys
 from collections import Counter, deque
+
+# Keep TensorFlow's CPU runtime conservative on small cloud containers.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 
 import av
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw
-
-try:
-    import tensorflow as tf
-except ModuleNotFoundError:
-    tf = None
 from streamlit_webrtc import webrtc_streamer
 
 APP_DIR = Path(__file__).resolve().parent
@@ -26,22 +29,48 @@ st.set_page_config(
     layout="wide",
 )
 
-if tf is None:
+# Do not import TensorFlow until a trained model actually exists. This keeps the
+# Streamlit app healthy before training and avoids loading a large native runtime
+# unnecessarily during startup.
+missing_assets = [
+    path.name
+    for path in (MODEL_PATH, CLASS_NAMES_PATH)
+    if not path.exists()
+]
+
+if missing_assets:
     st.title("🍎 Fruits-360 Live Recognition")
-    st.error("TensorFlow is not available in this Python environment.")
+    st.success("Streamlit deployment is running correctly.")
+    st.warning(
+        "The full Fruits-360 model has not been trained/uploaded yet. "
+        "Missing: " + ", ".join(missing_assets)
+    )
     st.write(f"Current Python: **{sys.version.split()[0]}**")
-    if sys.version_info >= (3, 14):
-        st.warning(
-            "This deployment is using Python 3.14. The TensorFlow build used by "
-            "this project supports Python up to 3.13. Delete this Streamlit app "
-            "and redeploy it with Python 3.13 or 3.12 in Advanced settings."
-        )
-    else:
-        st.info(
-            "Install the dependencies from fruits360_full_project/requirements.txt "
-            "and restart the app."
-        )
+    st.markdown(
+        "**Next step:** run `fruits360_full_project/Fruits360_Complete_Assignment_Training.ipynb` "
+        "and place the generated files in `fruits360_full_project/models/`."
+    )
+    st.code(
+        "models/\n"
+        "├── best_fruit_model.keras\n"
+        "├── class_names.json\n"
+        "└── model_metadata.json",
+        language="text",
+    )
     st.stop()
+
+if sys.version_info[:2] != (3, 12):
+    st.title("🍎 Fruits-360 Live Recognition")
+    st.error(
+        f"This trained-model deployment requires Python 3.12. "
+        f"Current Python: {sys.version.split()[0]}"
+    )
+    st.info("Redeploy this Streamlit app with Python 3.12 in Advanced settings.")
+    st.stop()
+
+# TensorFlow is imported only when model files are available and the Python
+# version matches the deployment environment used by the training project.
+import tensorflow as tf
 
 @st.cache_resource(show_spinner="Loading trained Fruits-360 model...")
 def load_assets():
