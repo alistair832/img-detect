@@ -1,0 +1,12 @@
+{
+  "dataset_handle": "moltean/fruits",
+  "image_size": 128,
+  "batch_size": 32,
+  "validation_split": 0.2,
+  "seed": 123,
+  "cnn_epochs": 8,
+  "transfer_epochs": 8,
+  "finetune_epochs": 4,
+  "early_stopping_patience": 2,
+  "deployment_max_mb": 90
+}
