@@ -1,8 +1,8 @@
 kagglehub>=1.0.0
-tensorflow==2.21.0
+tensorflow==2.20.0
 scikit-learn>=1.7,<2.0
 pandas>=2.2,<3.0
 matplotlib>=3.9,<4.0
-numpy>=1.26
-Pillow>=10
+numpy>=1.26,<2.3
+Pillow>=10,<12
 jupyter>=1.1,<2.0
