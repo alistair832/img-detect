@@ -1,0 +1,5 @@
+streamlit>=1.49,<2.0
+streamlit-webrtc
+tensorflow-cpu==2.20.0
+numpy>=1.26,<2.3
+Pillow>=10,<12
