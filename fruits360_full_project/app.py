@@ -1,12 +1,17 @@
 from pathlib import Path
 import json
+import sys
 from collections import Counter, deque
 
 import av
 import numpy as np
 import streamlit as st
-import tensorflow as tf
 from PIL import Image, ImageDraw
+
+try:
+    import tensorflow as tf
+except ModuleNotFoundError:
+    tf = None
 from streamlit_webrtc import webrtc_streamer
 
 APP_DIR = Path(__file__).resolve().parent
@@ -20,6 +25,23 @@ st.set_page_config(
     page_icon="🍎",
     layout="wide",
 )
+
+if tf is None:
+    st.title("🍎 Fruits-360 Live Recognition")
+    st.error("TensorFlow is not available in this Python environment.")
+    st.write(f"Current Python: **{sys.version.split()[0]}**")
+    if sys.version_info >= (3, 14):
+        st.warning(
+            "This deployment is using Python 3.14. The TensorFlow build used by "
+            "this project supports Python up to 3.13. Delete this Streamlit app "
+            "and redeploy it with Python 3.13 or 3.12 in Advanced settings."
+        )
+    else:
+        st.info(
+            "Install the dependencies from fruits360_full_project/requirements.txt "
+            "and restart the app."
+        )
+    st.stop()
 
 @st.cache_resource(show_spinner="Loading trained Fruits-360 model...")
 def load_assets():
