@@ -12,7 +12,7 @@ This folder contains a complete assignment workflow:
 
 ## Recommended workflow
 
-1. Use Python 3.12.
+1. Use Python 3.12 or 3.13 (recommended: 3.12).
 2. Open Jupyter from the repository root.
 3. Run `Fruits360_Complete_Assignment_Training.ipynb`.
 4. Wait for all three algorithms to finish.
@@ -27,7 +27,7 @@ This folder contains a complete assignment workflow:
 
 Deploy with:
 - Entry point: `fruits360_full_project/app.py`
-- Python: 3.12
+- Python: 3.12 (or 3.13)
 
 The `requirements.txt` located beside this app takes precedence over the root requirements file on Streamlit Community Cloud.
 
@@ -35,3 +35,7 @@ The `requirements.txt` located beside this app takes precedence over the root re
 
 The full 8GB-class Kaggle dataset is downloaded by the notebook and should NOT be committed to GitHub.
 The trained model is also generated after training. If it exceeds GitHub's normal file-size limit, use Git LFS or run Streamlit locally for the assignment demonstration.
+
+## Streamlit dependency troubleshooting
+
+The full TensorFlow deployment must not use Python 3.14. TensorFlow 2.21 supports Python through 3.13. If Streamlit Cloud shows an installer failure or the app reports that TensorFlow is unavailable, delete that Streamlit deployment and create it again with Python 3.12 or 3.13 in Advanced settings.
