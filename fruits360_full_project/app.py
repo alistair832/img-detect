@@ -30,8 +30,13 @@ CFG = {
     "transfer_epochs": 8,
     "finetune_epochs": 4,
     "deployment_max_mb": 90.0,
+    # Slightly emphasize Apple examples without forcing green fruits to Apple.
+    "apple_train_weight": 1.30,
 }
 
+# Fruits-360 contains many varieties of the same everyday fruit.  The new
+# training pipeline remaps those detailed folders to generic labels BEFORE
+# training, so all Apple varieties teach one APPLE output neuron.
 GENERIC_RULES = [
     ("Pomegranate", ("pomegranate",)),
     ("Pineapple", ("pineapple",)),
@@ -151,11 +156,12 @@ def find_split(root: Path, split_name: str) -> Path:
     )
     chosen = candidates[0]
     print(f"[DATA] Selected {split_name}: {chosen}", flush=True)
-    print(f"[DATA] Class folders: {folder_count(chosen)}", flush=True)
+    print(f"[DATA] Detailed class folders: {folder_count(chosen)}", flush=True)
     return chosen
 
 
 def make_datasets(tf, train_dir: Path, test_dir: Path):
+    """Create Fruits-360 datasets and remap detailed labels to generic labels."""
     image_size = (CFG["image_size"], CFG["image_size"])
     common = {
         "image_size": image_size,
@@ -163,7 +169,7 @@ def make_datasets(tf, train_dir: Path, test_dir: Path):
         "label_mode": "int",
     }
 
-    train_ds = tf.keras.utils.image_dataset_from_directory(
+    raw_train = tf.keras.utils.image_dataset_from_directory(
         train_dir,
         validation_split=CFG["validation_split"],
         subset="training",
@@ -171,7 +177,7 @@ def make_datasets(tf, train_dir: Path, test_dir: Path):
         shuffle=True,
         **common,
     )
-    val_ds = tf.keras.utils.image_dataset_from_directory(
+    raw_val = tf.keras.utils.image_dataset_from_directory(
         train_dir,
         validation_split=CFG["validation_split"],
         subset="validation",
@@ -179,33 +185,66 @@ def make_datasets(tf, train_dir: Path, test_dir: Path):
         shuffle=False,
         **common,
     )
-    test_ds = tf.keras.utils.image_dataset_from_directory(
+    raw_test = tf.keras.utils.image_dataset_from_directory(
         test_dir,
         shuffle=False,
         **common,
     )
 
-    class_names = list(train_ds.class_names)
+    detailed_names = list(raw_train.class_names)
+    generic_names, generic_groups = build_groups(detailed_names)
+
+    detailed_to_generic = [0] * len(detailed_names)
+    for generic_index, detailed_indexes in enumerate(generic_groups):
+        for detailed_index in detailed_indexes:
+            detailed_to_generic[detailed_index] = generic_index
+
+    mapping = tf.constant(detailed_to_generic, dtype=tf.int64)
+    apple_index = generic_names.index("Apple") if "Apple" in generic_names else -1
+
+    def remap_pair(images, labels):
+        return images, tf.gather(mapping, tf.cast(labels, tf.int32))
+
+    def remap_train(images, labels):
+        generic_labels = tf.gather(mapping, tf.cast(labels, tf.int32))
+        if apple_index >= 0:
+            weights = tf.where(
+                tf.equal(generic_labels, tf.cast(apple_index, tf.int64)),
+                tf.cast(CFG["apple_train_weight"], tf.float32),
+                tf.constant(1.0, tf.float32),
+            )
+            return images, generic_labels, weights
+        return images, generic_labels
+
     autotune = tf.data.AUTOTUNE
+    train_ds = raw_train.map(remap_train, num_parallel_calls=autotune).prefetch(autotune)
+    val_ds = raw_val.map(remap_pair, num_parallel_calls=autotune).prefetch(autotune)
+    test_ds = raw_test.map(remap_pair, num_parallel_calls=autotune).prefetch(autotune)
+
     return (
-        train_ds.prefetch(autotune),
-        val_ds.prefetch(autotune),
-        test_ds.prefetch(autotune),
-        class_names,
+        train_ds,
+        val_ds,
+        test_ds,
+        detailed_names,
+        generic_names,
         image_size,
+        apple_index,
     )
 
 
 def augmentation(tf):
+    """Augmentation is intentionally stronger to resemble phone/webcam photos."""
     return tf.keras.Sequential(
         [
             tf.keras.layers.RandomFlip("horizontal"),
-            tf.keras.layers.RandomRotation(0.15),
-            tf.keras.layers.RandomZoom(0.15),
-            tf.keras.layers.RandomContrast(0.20),
-            tf.keras.layers.RandomTranslation(0.08, 0.08),
+            tf.keras.layers.RandomRotation(0.18),
+            tf.keras.layers.RandomZoom(0.18),
+            tf.keras.layers.RandomContrast(0.25),
+            tf.keras.layers.RandomBrightness(0.18, value_range=(0.0, 255.0)),
+            tf.keras.layers.RandomTranslation(0.10, 0.10),
+            tf.keras.layers.GaussianNoise(4.0),
         ],
-        name="augmentation",
+        name="camera_style_augmentation",
     )
 
 
@@ -222,15 +261,17 @@ def build_custom_cnn(tf, num_classes: int, image_size: tuple[int, int]):
     x = augmentation(tf)(inputs)
     x = tf.keras.layers.Rescaling(1.0 / 255)(x)
     for filters in (32, 64, 128):
-        x = tf.keras.layers.Conv2D(
-            filters, 3, padding="same", activation="relu"
-        )(x)
+        x = tf.keras.layers.Conv2D(filters, 3, padding="same", activation="relu")(x)
         x = tf.keras.layers.BatchNormalization()(x)
         x = tf.keras.layers.MaxPooling2D()(x)
     x = tf.keras.layers.Conv2D(192, 3, padding="same", activation="relu")(x)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     x = tf.keras.layers.Dropout(0.30)(x)
-    model = tf.keras.Model(inputs, tf.keras.layers.Dense(num_classes)(x), name="Custom_CNN")
+    model = tf.keras.Model(
+        inputs,
+        tf.keras.layers.Dense(num_classes)(x),
+        name="Custom_CNN_Generic",
+    )
     compile_model(tf, model, 1e-3)
     return model
 
@@ -238,12 +279,16 @@ def build_custom_cnn(tf, num_classes: int, image_size: tuple[int, int]):
 def build_transfer(tf, name: str, num_classes: int, image_size: tuple[int, int]):
     if name == "MobileNetV2":
         base = tf.keras.applications.MobileNetV2(
-            include_top=False, weights="imagenet", input_shape=image_size + (3,)
+            include_top=False,
+            weights="imagenet",
+            input_shape=image_size + (3,),
         )
         preprocess = tf.keras.applications.mobilenet_v2.preprocess_input
     else:
         base = tf.keras.applications.ResNet50(
-            include_top=False, weights="imagenet", input_shape=image_size + (3,)
+            include_top=False,
+            weights="imagenet",
+            input_shape=image_size + (3,),
         )
         preprocess = tf.keras.applications.resnet50.preprocess_input
 
@@ -253,8 +298,12 @@ def build_transfer(tf, name: str, num_classes: int, image_size: tuple[int, int])
     x = preprocess(x)
     x = base(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Dropout(0.25)(x)
-    model = tf.keras.Model(inputs, tf.keras.layers.Dense(num_classes)(x), name=name)
+    x = tf.keras.layers.Dropout(0.30)(x)
+    model = tf.keras.Model(
+        inputs,
+        tf.keras.layers.Dense(num_classes)(x),
+        name=f"{name}_Generic",
+    )
     compile_model(tf, model, 1e-3)
     return model, base
 
@@ -262,10 +311,15 @@ def build_transfer(tf, name: str, num_classes: int, image_size: tuple[int, int])
 def callbacks(tf):
     return [
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=2, restore_best_weights=True
+            monitor="val_loss",
+            patience=2,
+            restore_best_weights=True,
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.3, patience=1, min_lr=1e-7
+            monitor="val_loss",
+            factor=0.3,
+            patience=1,
+            min_lr=1e-7,
         ),
     ]
 
@@ -283,9 +337,18 @@ def fit_model(tf, model, train_ds, val_ds, epochs: int, quick: bool):
     model.fit(train_ds, **kwargs)
 
 
-def evaluate_model(tf, accuracy_score, prf, model, test_ds, quick: bool):
+def evaluate_model(
+    tf,
+    accuracy_score,
+    prf,
+    model,
+    test_ds,
+    apple_index: int,
+    quick: bool,
+):
     y_true, y_pred = [], []
     start = time.perf_counter()
+
     for batch_index, (images, labels) in enumerate(test_ds):
         logits = model(images, training=False)
         predictions = tf.argmax(logits, axis=1).numpy()
@@ -297,9 +360,35 @@ def evaluate_model(tf, accuracy_score, prf, model, test_ds, quick: bool):
     elapsed = time.perf_counter() - start
     accuracy = accuracy_score(y_true, y_pred)
     precision, recall, f1, _ = prf(
-        y_true, y_pred, average="macro", zero_division=0
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
     )
-    return accuracy, precision, recall, f1, elapsed, len(y_true) / elapsed if elapsed else 0.0
+
+    apple_precision = apple_recall = apple_f1 = 0.0
+    if apple_index >= 0:
+        apple_true = [1 if value == apple_index else 0 for value in y_true]
+        apple_pred = [1 if value == apple_index else 0 for value in y_pred]
+        apple_precision, apple_recall, apple_f1, _ = prf(
+            apple_true,
+            apple_pred,
+            average="binary",
+            zero_division=0,
+        )
+
+    ips = len(y_true) / elapsed if elapsed else 0.0
+    return (
+        accuracy,
+        precision,
+        recall,
+        f1,
+        apple_precision,
+        apple_recall,
+        apple_f1,
+        elapsed,
+        ips,
+    )
 
 
 def training_worker(quick: bool = False):
@@ -324,12 +413,30 @@ def training_worker(quick: bool = False):
     )
     train_dir = find_split(root, "Training")
     test_dir = find_split(root, "Test")
-    train_ds, val_ds, test_ds, class_names, image_size = make_datasets(
-        tf, train_dir, test_dir
-    )
-    print(f"[2/6] Detailed classes: {len(class_names)}", flush=True)
 
-    num_classes = len(class_names)
+    (
+        train_ds,
+        val_ds,
+        test_ds,
+        detailed_names,
+        generic_names,
+        image_size,
+        apple_index,
+    ) = make_datasets(tf, train_dir, test_dir)
+
+    print(
+        f"[2/6] {len(detailed_names)} detailed classes remapped to "
+        f"{len(generic_names)} generic classes BEFORE training.",
+        flush=True,
+    )
+    if apple_index >= 0:
+        print(
+            f"[APPLE] Apple is generic class {apple_index}; "
+            f"training weight={CFG['apple_train_weight']:.2f}.",
+            flush=True,
+        )
+
+    num_classes = len(generic_names)
     cnn_epochs = 1 if quick else CFG["cnn_epochs"]
     transfer_epochs = 1 if quick else CFG["transfer_epochs"]
     finetune_epochs = 1 if quick else CFG["finetune_epochs"]
@@ -341,30 +448,53 @@ def training_worker(quick: bool = False):
         "ResNet50": MODELS / "resnet50.keras",
     }
 
-    print("[3/6] Training Custom CNN...", flush=True)
+    print("[3/6] Training Custom CNN on generic labels...", flush=True)
     model = build_custom_cnn(tf, num_classes, image_size)
     fit_model(tf, model, train_ds, val_ds, cnn_epochs, quick)
     model.save(paths["Custom_CNN"])
     trained["Custom_CNN"] = model
 
-    for name, unfreeze in (("MobileNetV2", 30), ("ResNet50", 25)):
-        print(f"[3/6] Training {name}...", flush=True)
+    for name, unfreeze in (("MobileNetV2", 35), ("ResNet50", 30)):
+        print(f"[3/6] Training {name} on generic labels...", flush=True)
         model, base = build_transfer(tf, name, num_classes, image_size)
         fit_model(tf, model, train_ds, val_ds, transfer_epochs, quick)
+
         base.trainable = True
         for layer in base.layers[:-unfreeze]:
             layer.trainable = False
         compile_model(tf, model, 1e-5)
         fit_model(tf, model, train_ds, val_ds, finetune_epochs, quick)
+
         model.save(paths[name])
         trained[name] = model
 
-    print("[4/6] Evaluating models...", flush=True)
+    print("[4/6] Evaluating generic models and Apple performance...", flush=True)
     rows = []
     for name, model in trained.items():
-        accuracy, precision, recall, f1, seconds, ips = evaluate_model(
-            tf, accuracy_score, prf, model, test_ds, quick
+        (
+            accuracy,
+            precision,
+            recall,
+            f1,
+            apple_precision,
+            apple_recall,
+            apple_f1,
+            seconds,
+            ips,
+        ) = evaluate_model(
+            tf,
+            accuracy_score,
+            prf,
+            model,
+            test_ds,
+            apple_index,
+            quick,
         )
+
+        # Keep overall quality dominant while giving Apple performance a role
+        # in deployment-model selection.
+        selection_score = 0.75 * float(f1) + 0.25 * float(apple_f1)
+
         rows.append(
             {
                 "Model": name,
@@ -372,6 +502,10 @@ def training_worker(quick: bool = False):
                 "Macro Precision": float(precision),
                 "Macro Recall": float(recall),
                 "Macro F1": float(f1),
+                "Apple Precision": float(apple_precision),
+                "Apple Recall": float(apple_recall),
+                "Apple F1": float(apple_f1),
+                "Selection Score": selection_score,
                 "Inference seconds": float(seconds),
                 "Images / second": float(ips),
                 "Model MB": paths[name].stat().st_size / (1024 * 1024),
@@ -380,16 +514,25 @@ def training_worker(quick: bool = False):
 
     print("[5/6] Saving comparison...", flush=True)
     results = pd.DataFrame(rows).sort_values(
-        "Macro F1", ascending=False
+        ["Selection Score", "Macro F1"],
+        ascending=False,
     ).reset_index(drop=True)
     results.to_csv(CSV, index=False)
 
-    ax = results.set_index("Model")[[
-        "Accuracy", "Macro Precision", "Macro Recall", "Macro F1"
-    ]].plot(kind="bar", figsize=(10, 5))
+    chart_cols = [
+        "Accuracy",
+        "Macro F1",
+        "Apple Precision",
+        "Apple Recall",
+        "Apple F1",
+    ]
+    ax = results.set_index("Model")[chart_cols].plot(
+        kind="bar",
+        figsize=(11, 5),
+    )
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("Score")
-    ax.set_title("Fruits-360 Model Comparison")
+    ax.set_title("Fruits-360 Generic Model + Apple Performance")
     plt.xticks(rotation=0)
     plt.tight_layout()
     plt.savefig(PNG, dpi=160)
@@ -400,20 +543,25 @@ def training_worker(quick: bool = False):
     best_name = str(selected["Model"])
     shutil.copy2(paths[best_name], MODEL)
 
+    # New models output generic classes directly.
     CLASSES.write_text(
-        json.dumps(class_names, ensure_ascii=False, indent=2),
+        json.dumps(generic_names, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    generic_names, _ = build_groups(class_names)
     META.write_text(
         json.dumps(
             {
                 "dataset_handle": CFG["dataset_handle"],
                 "best_model": best_name,
-                "num_classes": len(class_names),
-                "num_generic_classes": len(generic_names),
+                "label_mode": "generic",
+                "num_detailed_source_classes": len(detailed_names),
+                "num_classes": len(generic_names),
                 "test_accuracy": float(selected["Accuracy"]),
                 "macro_f1": float(selected["Macro F1"]),
+                "apple_precision": float(selected["Apple Precision"]),
+                "apple_recall": float(selected["Apple Recall"]),
+                "apple_f1": float(selected["Apple F1"]),
+                "apple_train_weight": float(CFG["apple_train_weight"]),
                 "quick_run": bool(quick),
                 "tensorflow_version": tf.__version__,
             },
@@ -421,7 +569,11 @@ def training_worker(quick: bool = False):
         ),
         encoding="utf-8",
     )
-    print("[6/6] Deployment model exported.", flush=True)
+    print(
+        f"[6/6] Exported {best_name}; Apple F1="
+        f"{float(selected['Apple F1']) * 100:.2f}%.",
+        flush=True,
+    )
 
 
 if "--train-worker" in sys.argv:
@@ -472,19 +624,36 @@ def model_ready() -> bool:
     return MODEL.exists() and CLASSES.exists()
 
 
+def square_crop(image: Image.Image) -> Image.Image:
+    """Remove landscape stretching while keeping the centered fruit."""
+    image = image.convert("RGB")
+    width, height = image.size
+    side = min(width, height)
+    left = max(0, (width - side) // 2)
+    top = max(0, (height - side) // 2)
+    return image.crop((left, top, left + side, top + side))
+
+
 st.title("🍎 Fruits-360 All-in-One AI System")
-st.caption("Reliable camera version — no WebRTC START button.")
+st.caption(
+    "Apple-focused generic training: varieties are merged before training, "
+    "not only after prediction."
+)
 
 meta = load_metadata()
 ready = model_ready()
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Python", sys.version.split()[0])
 c2.metric("Model", "Ready ✅" if ready else "Not trained")
-c3.metric("Classes", meta.get("num_classes", "—"))
+c3.metric("Generic classes", meta.get("num_classes", "—"))
 c4.metric(
-    "Accuracy",
+    "Overall accuracy",
     f"{meta['test_accuracy'] * 100:.2f}%" if "test_accuracy" in meta else "—",
+)
+c5.metric(
+    "Apple F1",
+    f"{meta['apple_f1'] * 100:.2f}%" if "apple_f1" in meta else "—",
 )
 
 train_tab, results_tab, detect_tab = st.tabs(
@@ -492,7 +661,16 @@ train_tab, results_tab, detect_tab = st.tabs(
 )
 
 with train_tab:
-    st.subheader("Train Fruits-360 Models")
+    st.subheader("Train Generic Fruits-360 Models")
+    st.success(
+        "New training method: all Apple varieties are mapped to one Apple label "
+        "before the neural network is trained."
+    )
+    st.caption(
+        "Apple examples receive a small 1.30× training weight. This improves "
+        "Apple learning without blindly changing every green fruit into Apple."
+    )
+
     token = secret("KAGGLE_API_TOKEN")
     entered = "" if token else st.text_input("Kaggle API token", type="password")
 
@@ -504,11 +682,12 @@ with train_tab:
 
     if mode == "Quick pipeline test":
         st.warning(
-            "Quick Test is only for checking the pipeline and is blocked from final recognition."
+            "Quick Test checks code only. It is blocked from final recognition."
         )
     else:
         st.info(
-            "Full assignment training uses the full selected Fruits-360 classification split."
+            "Full training is required to obtain the improved Apple model. "
+            "An old saved model will not gain the new accuracy automatically."
         )
 
     if st.button(
@@ -576,6 +755,10 @@ with results_tab:
             "Macro Precision",
             "Macro Recall",
             "Macro F1",
+            "Apple Precision",
+            "Apple Recall",
+            "Apple F1",
+            "Selection Score",
         ):
             if column in display.columns:
                 display[column] = display[column].map(
@@ -584,6 +767,13 @@ with results_tab:
         st.dataframe(display, use_container_width=True, hide_index=True)
         if PNG.exists():
             st.image(str(PNG), use_container_width=True)
+
+        if "Apple F1" in df.columns:
+            best_apple = df.sort_values("Apple F1", ascending=False).iloc[0]
+            st.success(
+                f"Best Apple model in this run: {best_apple['Model']} — "
+                f"Apple F1 {float(best_apple['Apple F1']) * 100:.2f}%"
+            )
     else:
         st.info("No results yet.")
 
@@ -605,134 +795,119 @@ with detect_tab:
         @st.cache_resource(show_spinner="Loading trained fruit model...")
         def runtime():
             model = tf.keras.models.load_model(MODEL, compile=False)
-            detailed_names = json.loads(CLASSES.read_text(encoding="utf-8"))
-            generic_names, generic_groups = build_groups(detailed_names)
+            saved_names = json.loads(CLASSES.read_text(encoding="utf-8"))
             image_size = (
                 int(model.input_shape[2]),
                 int(model.input_shape[1]),
             )
-            return model, detailed_names, generic_names, generic_groups, image_size
 
-        model, detailed_names, generic_names, generic_groups, image_size = runtime()
+            if meta.get("label_mode") == "generic":
+                return model, saved_names, None, image_size, "generic"
+
+            # Compatibility with an older detailed-class model already present
+            # in a running Streamlit instance.
+            generic_names, generic_groups = build_groups(saved_names)
+            return (
+                model,
+                generic_names,
+                generic_groups,
+                image_size,
+                "legacy-detailed",
+            )
+
+        model, output_names, legacy_groups, image_size, label_mode = runtime()
 
         def predict(image: Image.Image, top_k: int = 5):
-            resized = image.convert("RGB").resize(
+            prepared = square_crop(image)
+            resized = prepared.resize(
                 image_size,
                 Image.Resampling.BILINEAR,
             )
             array = np.asarray(resized, dtype=np.float32)[None, ...]
             logits = model(array, training=False)[0]
-            detailed_probs = tf.nn.softmax(logits, axis=-1).numpy().astype(np.float32)
+            raw_probs = tf.nn.softmax(logits, axis=-1).numpy().astype(np.float32)
 
-            generic_probs = np.array(
-                [
-                    float(detailed_probs[indexes].sum())
-                    for indexes in generic_groups
-                ],
-                dtype=np.float32,
+            if label_mode == "generic":
+                probs = raw_probs
+            else:
+                probs = np.array(
+                    [
+                        float(raw_probs[indexes].sum())
+                        for indexes in legacy_groups
+                    ],
+                    dtype=np.float32,
+                )
+                total = float(probs.sum())
+                if total > 0:
+                    probs /= total
+
+            order = np.argsort(probs)[::-1][:top_k]
+            return [
+                (output_names[int(index)], float(probs[int(index)]))
+                for index in order
+            ], prepared
+
+        if meta.get("label_mode") != "generic":
+            st.warning(
+                "This running app still has an older detailed-class model. "
+                "Run Full assignment training once to activate the new "
+                "Apple-focused generic model."
             )
-            total = float(generic_probs.sum())
-            if total > 0:
-                generic_probs /= total
-
-            generic_order = np.argsort(generic_probs)[::-1][:top_k]
-            detailed_order = np.argsort(detailed_probs)[::-1][:top_k]
-
-            generic_results = [
-                (
-                    generic_names[int(index)],
-                    float(generic_probs[int(index)]),
-                )
-                for index in generic_order
-            ]
-            detailed_results = [
-                (
-                    detailed_names[int(index)],
-                    float(detailed_probs[int(index)]),
-                )
-                for index in detailed_order
-            ]
-            return generic_results, detailed_results
-
-        st.success(
-            f"Model ready: {len(detailed_names)} detailed classes → "
-            f"{len(generic_names)} grouped output labels."
-        )
+        else:
+            st.success(
+                "New generic model active. Apple varieties were merged before training."
+            )
 
         camera_tab, upload_tab = st.tabs(
             ["📸 Take Photo", "🖼️ Upload Image"]
         )
 
+        def show_result(image: Image.Image):
+            results, prepared = predict(image)
+            best_name, best_conf = results[0]
+
+            left, right = st.columns(2)
+            with left:
+                st.image(
+                    prepared,
+                    caption="Square crop used by the model",
+                    use_container_width=True,
+                )
+            with right:
+                if best_conf >= 0.42:
+                    st.success(f"Detected: **{best_name}**")
+                else:
+                    st.warning(f"Low confidence: **{best_name}**")
+
+                st.metric("Confidence", f"{best_conf * 100:.2f}%")
+                st.subheader("Top predictions")
+                for name, confidence in results:
+                    st.write(f"**{name}** — {confidence * 100:.2f}%")
+                    st.progress(float(min(max(confidence, 0.0), 1.0)))
+
         with camera_tab:
             st.info(
-                "This camera uses Streamlit's built-in camera capture. "
-                "There is no WebRTC START button, so it will not auto-disconnect."
+                "For best Apple accuracy: put one apple near the center, "
+                "fill most of the frame, and use a plain/light background."
             )
             captured = st.camera_input(
                 "Take a photo of ONE fruit",
-                key="fruit-camera-reliable-v1",
+                key="fruit-camera-apple-v2",
             )
-
             if captured is not None:
-                image = Image.open(captured).convert("RGB")
-                left, right = st.columns(2)
-
-                with left:
-                    st.image(image, use_container_width=True)
-
-                with right:
-                    results, detailed = predict(image)
-                    best_name, best_conf = results[0]
-
-                    if best_conf >= 0.38:
-                        st.success(f"Detected: **{best_name}**")
-                    else:
-                        st.warning(f"Low confidence: **{best_name}**")
-
-                    st.metric("Confidence", f"{best_conf * 100:.2f}%")
-                    st.subheader("Top predictions")
-                    for name, confidence in results:
-                        st.write(f"**{name}** — {confidence * 100:.2f}%")
-                        st.progress(float(min(max(confidence, 0.0), 1.0)))
-
-                    with st.expander("Detailed Fruits-360 classes"):
-                        for name, confidence in detailed:
-                            st.write(f"{name} — {confidence * 100:.2f}%")
+                show_result(Image.open(captured).convert("RGB"))
 
         with upload_tab:
             uploaded = st.file_uploader(
                 "Upload JPG, JPEG, PNG or WEBP",
                 type=["jpg", "jpeg", "png", "webp"],
-                key="fruit-upload-reliable-v1",
+                key="fruit-upload-apple-v2",
             )
-
             if uploaded is not None:
-                image = Image.open(uploaded).convert("RGB")
-                left, right = st.columns(2)
-
-                with left:
-                    st.image(image, use_container_width=True)
-
-                with right:
-                    results, detailed = predict(image)
-                    best_name, best_conf = results[0]
-
-                    if best_conf >= 0.38:
-                        st.success(f"Detected: **{best_name}**")
-                    else:
-                        st.warning(f"Low confidence: **{best_name}**")
-
-                    st.metric("Confidence", f"{best_conf * 100:.2f}%")
-                    st.subheader("Top predictions")
-                    for name, confidence in results:
-                        st.write(f"**{name}** — {confidence * 100:.2f}%")
-                        st.progress(float(min(max(confidence, 0.0), 1.0)))
-
-                    with st.expander("Detailed Fruits-360 classes"):
-                        for name, confidence in detailed:
-                            st.write(f"{name} — {confidence * 100:.2f}%")
+                show_result(Image.open(uploaded).convert("RGB"))
 
 st.divider()
 st.caption(
-    "Reliable camera build: Streamlit camera_input replaces the unstable WebRTC START button."
+    "Apple accuracy build: generic-label training + Apple-weighted learning + "
+    "camera-style augmentation + square-crop inference."
 )
