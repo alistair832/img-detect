@@ -107,7 +107,7 @@ def softmax(scores: np.ndarray, temperature: float = 1.25) -> np.ndarray:
 
 
 def apple_visual_evidence(image: Image.Image) -> dict[str, float]:
-    """Visual cues used only to reduce Apple/Lime/Pomegranate confusion."""
+    """Visual cues used to reduce Apple/Lime/Pomegranate/Guava confusion."""
     rgb = np.asarray(
         image.convert("RGB").resize((160, 160), Image.Resampling.BILINEAR),
         dtype=np.uint8,
@@ -165,17 +165,42 @@ def apply_apple_correction(
     evidence = apple_visual_evidence(image)
     reason = ""
 
-    if evidence["cream_fraction"] >= 0.08 and evidence["red_fraction"] >= 0.08:
-        adjusted[APPLE] *= 3.8
-        adjusted[POMEGRANATE] *= 0.38
-        reason = "Apple correction: pale flesh + red skin detected."
+    # Cut red apple: pale flesh together with red skin is a strong cue.
+    if (
+        evidence["cream_fraction"] >= 0.08
+        and evidence["red_fraction"] >= 0.08
+        and probabilities[APPLE] >= 0.05
+    ):
+        adjusted[APPLE] *= 4.5
+        adjusted[POMEGRANATE] *= 0.30
+        adjusted[GUAVA] *= 0.70
+        reason = "Apple correction: pale flesh + red apple skin detected."
+
+    # Cut green apple: this directly addresses the common Apple -> Guava error.
+    # Require BOTH a large pale flesh area and green skin, plus some support from
+    # the saved model, so an ordinary whole guava is not automatically changed.
+    elif (
+        evidence["cream_fraction"] >= 0.18
+        and evidence["moderate_green_fraction"] >= 0.10
+        and evidence["mean_saturation"] < 165
+        and probabilities[APPLE] >= 0.07
+    ):
+        adjusted[APPLE] *= 6.0
+        adjusted[GUAVA] *= 0.28
+        adjusted[LIME] *= 0.48
+        reason = "Apple correction: green skin + pale cut apple flesh detected."
+
+    # Whole green apple: gentler correction because a whole guava/lime can also
+    # be green. This only activates when the model already gives Apple support.
     elif (
         evidence["moderate_green_fraction"] >= 0.16
         and evidence["mean_saturation"] < 155
+        and probabilities[APPLE] >= 0.10
     ):
-        adjusted[APPLE] *= 2.15
-        adjusted[LIME] *= 0.72
-        reason = "Apple correction: bright, moderately saturated green detected."
+        adjusted[APPLE] *= 2.8
+        adjusted[GUAVA] *= 0.72
+        adjusted[LIME] *= 0.62
+        reason = "Apple correction: green-apple colour pattern detected."
 
     adjusted /= adjusted.sum() + 1e-8
     return adjusted, reason
@@ -360,8 +385,8 @@ st.caption("Live front-camera + image upload detection only — no training page
 
 st.info(
     "Supported fruits: **Apple, Banana, Guava, Lime, Orange, Pomegranate**. "
-    "Apple recognition includes extra checks to reduce Apple → Pomegranate "
-    "and Apple → Lime mistakes."
+    "Apple recognition includes extra checks to reduce Apple → Pomegranate, "
+    "Apple → Lime and Apple → Guava mistakes."
 )
 
 camera_tab, upload_tab = st.tabs(["🎥 Live Front Camera", "🖼️ Upload Image"])
@@ -374,7 +399,7 @@ with camera_tab:
     )
 
     webrtc_streamer(
-        key="fruit-live-front-camera-v4",
+        key="fruit-live-front-camera-v5",
         video_frame_callback=video_frame_callback,
         media_stream_constraints={
             "video": {
@@ -410,7 +435,7 @@ with upload_tab:
     uploaded = st.file_uploader(
         "Choose JPG, JPEG, PNG or WEBP",
         type=["jpg", "jpeg", "png", "webp"],
-        key="fruit-detection-upload-v4",
+        key="fruit-detection-upload-v5",
     )
 
     if uploaded is not None:
