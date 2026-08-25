@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter, deque
 from io import BytesIO
 from pathlib import Path
 
+import av
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
+from streamlit_webrtc import webrtc_streamer
 
 st.set_page_config(
     page_title="Fruit Image Detection",
@@ -132,8 +135,6 @@ def apple_visual_evidence(image: Image.Image) -> dict[str, float]:
         & (green_channel > red_channel * 1.04)
         & (green_channel > blue_channel * 1.08)
     )
-
-    # Pale flesh + red skin is a strong apple cue for cut-apple photos.
     cream_mask = (
         object_mask
         & (red_channel > 175)
@@ -142,7 +143,6 @@ def apple_visual_evidence(image: Image.Image) -> dict[str, float]:
         & (saturation < 105)
         & (value > 165)
     )
-
     moderate_green_mask = green_mask & (saturation < 165) & (value > 105)
 
     return {
@@ -160,21 +160,15 @@ def apply_apple_correction(
     probabilities: np.ndarray,
     image: Image.Image,
 ) -> tuple[np.ndarray, str]:
-    """Keep the model primary, but correct common Apple confusions."""
+    """Keep the saved model primary while reducing common Apple confusions."""
     adjusted = probabilities.astype(np.float32).copy()
     evidence = apple_visual_evidence(image)
     reason = ""
 
-    # Red/cut apple versus pomegranate.
-    if (
-        evidence["cream_fraction"] >= 0.08
-        and evidence["red_fraction"] >= 0.08
-    ):
+    if evidence["cream_fraction"] >= 0.08 and evidence["red_fraction"] >= 0.08:
         adjusted[APPLE] *= 3.8
         adjusted[POMEGRANATE] *= 0.38
         reason = "Apple correction: pale flesh + red skin detected."
-
-    # Green apple versus lime.
     elif (
         evidence["moderate_green_fraction"] >= 0.16
         and evidence["mean_saturation"] < 155
@@ -213,10 +207,7 @@ def image_quality(image: Image.Image) -> tuple[bool, str]:
 
 def predict_one(image: Image.Image) -> dict:
     probabilities = softmax(model_scores(extract_features(image)))
-    probabilities, correction_reason = apply_apple_correction(
-        probabilities,
-        image,
-    )
+    probabilities, correction_reason = apply_apple_correction(probabilities, image)
 
     order = np.argsort(probabilities)[::-1]
     first = int(order[0])
@@ -237,6 +228,7 @@ def predict_one(image: Image.Image) -> dict:
         reason = correction_reason
 
     return {
+        "index": first,
         "fruit": CLASSES[first],
         "confidence": confidence,
         "probabilities": probabilities,
@@ -281,11 +273,7 @@ def show_result(image: Image.Image):
     image_col, result_col = st.columns([1.05, 1])
 
     with image_col:
-        st.image(
-            image,
-            caption="Selected image",
-            use_container_width=True,
-        )
+        st.image(image, caption="Selected image", use_container_width=True)
 
     with result_col:
         if result["known"]:
@@ -296,10 +284,7 @@ def show_result(image: Image.Image):
         if result["reason"]:
             st.caption(result["reason"])
 
-        st.metric(
-            "Prediction confidence",
-            f"{result['confidence'] * 100:.1f}%",
-        )
+        st.metric("Prediction confidence", f"{result['confidence'] * 100:.1f}%")
 
         st.subheader("Top 3 predictions")
         order = np.argsort(probabilities)[::-1][:3]
@@ -309,8 +294,69 @@ def show_result(image: Image.Image):
             st.progress(float(min(max(score, 0.0), 1.0)))
 
 
+# -----------------------------------------------------------------------------
+# Live front-camera detection
+# -----------------------------------------------------------------------------
+LIVE_HISTORY = deque(maxlen=12)
+
+
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    rgb = frame.to_ndarray(format="rgb24")
+    # Mirror the front camera so it behaves naturally like a selfie camera.
+    rgb = rgb[:, ::-1].copy()
+    image = Image.fromarray(rgb)
+
+    width, height = image.size
+    box_size = int(min(width, height) * 0.62)
+    left = max(0, (width - box_size) // 2)
+    top = max(0, (height - box_size) // 2)
+    right = min(width, left + box_size)
+    bottom = min(height, top + box_size)
+
+    roi = image.crop((left, top, right, bottom))
+    result = predict_one(roi)
+    LIVE_HISTORY.append(result)
+
+    if len(LIVE_HISTORY) < 4:
+        label = "Analyzing fruit..."
+    else:
+        recent = list(LIVE_HISTORY)[-10:]
+        known = [item for item in recent if item["known"]]
+
+        if len(known) >= 4:
+            stable_index = Counter(item["index"] for item in known).most_common(1)[0][0]
+            matching = [item for item in known if item["index"] == stable_index]
+            if len(matching) >= 3:
+                avg_confidence = float(
+                    np.mean([item["confidence"] for item in matching[-6:]])
+                )
+                label = f"{CLASSES[stable_index]} — {avg_confidence * 100:.1f}%"
+            else:
+                label = "Hold fruit steady in the green box"
+        else:
+            best = max(recent, key=lambda item: item["confidence"])
+            label = f"Unknown / best guess {best['fruit']} — {best['confidence'] * 100:.1f}%"
+
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((left, top, right, bottom), outline=(40, 220, 90), width=5)
+
+    text_right = min(width - 12, max(360, width - 12))
+    draw.rounded_rectangle((12, 12, text_right, 66), radius=12, fill=(0, 0, 0))
+    draw.text((24, 31), label, fill=(255, 255, 255))
+
+    guide_top = max(top, bottom - 38)
+    draw.rectangle((left, guide_top, right, bottom), fill=(0, 0, 0))
+    draw.text(
+        (left + 10, guide_top + 10),
+        "Place ONE fruit inside the green box",
+        fill=(255, 255, 255),
+    )
+
+    return av.VideoFrame.from_ndarray(np.asarray(image), format="rgb24")
+
+
 st.title("🍎 Fruit Image Detection")
-st.caption("Detection only — no training page.")
+st.caption("Live front-camera + image upload detection only — no training page.")
 
 st.info(
     "Supported fruits: **Apple, Banana, Guava, Lime, Orange, Pomegranate**. "
@@ -318,30 +364,53 @@ st.info(
     "and Apple → Lime mistakes."
 )
 
-camera_tab, upload_tab = st.tabs(["📸 Camera", "🖼️ Upload Image"])
+camera_tab, upload_tab = st.tabs(["🎥 Live Front Camera", "🖼️ Upload Image"])
 
 with camera_tab:
-    st.subheader("Take a Fruit Photo")
+    st.subheader("Live Front Camera")
     st.write(
-        "Place one fruit near the centre, use good lighting, and let the fruit "
-        "fill most of the camera view."
+        "Press **START**, allow camera permission, then hold one fruit inside the "
+        "green square. The prediction updates live and is smoothed across frames."
     )
 
-    captured = st.camera_input(
-        "Take a picture",
-        key="fruit-detection-camera-v3",
+    webrtc_streamer(
+        key="fruit-live-front-camera-v4",
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={
+            "video": {
+                "facingMode": "user",
+                "width": {"ideal": 640},
+                "height": {"ideal": 480},
+                "frameRate": {"ideal": 20, "max": 24},
+            },
+            "audio": False,
+        },
+        rtc_configuration={
+            "iceServers": [
+                {
+                    "urls": [
+                        "stun:stun.l.google.com:19302",
+                        "stun:stun1.l.google.com:19302",
+                        "stun:stun2.l.google.com:19302",
+                    ]
+                },
+                {"urls": ["stun:stun.cloudflare.com:3478"]},
+            ]
+        },
+        async_processing=True,
     )
 
-    if captured is not None:
-        image = Image.open(captured).convert("RGB")
-        show_result(image)
+    st.caption(
+        "If the browser asks for permission, choose Allow. For best accuracy, "
+        "use good lighting and let the fruit fill most of the green box."
+    )
 
 with upload_tab:
     st.subheader("Upload a Fruit Image")
     uploaded = st.file_uploader(
         "Choose JPG, JPEG, PNG or WEBP",
         type=["jpg", "jpeg", "png", "webp"],
-        key="fruit-detection-upload-v3",
+        key="fruit-detection-upload-v4",
     )
 
     if uploaded is not None:
@@ -350,6 +419,6 @@ with upload_tab:
 
 st.divider()
 st.caption(
-    "Image-detection deployment: camera and upload only. "
-    "The training system is intentionally removed from the Streamlit interface."
+    "Detection-only deployment: live front camera and upload image. "
+    "No model-training interface is shown in Streamlit."
 )
