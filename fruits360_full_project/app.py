@@ -19,6 +19,7 @@ APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR.parent
 MODEL_DIR = REPO_ROOT / "model_data"
 MODEL_PARTS = [MODEL_DIR / f"hgb80_{i:02d}.txt" for i in range(9)]
+
 CLASSES = ["Apple", "Banana", "Guava", "Lime", "Orange", "Pomegranate"]
 APPLE, BANANA, GUAVA, LIME, ORANGE, POMEGRANATE = range(6)
 
@@ -61,8 +62,7 @@ def extract_features(image):
         np.asarray(
             image.resize((8, 8), Image.Resampling.BILINEAR),
             dtype=np.float32,
-        ).reshape(-1)
-        / 255.0,
+        ).reshape(-1) / 255.0,
     ]
     return np.concatenate(parts).astype(np.float32)
 
@@ -105,7 +105,6 @@ def components(mask, min_area=1, max_area=None):
                 cy, cx = stack.pop()
                 xs.append(cx)
                 ys.append(cy)
-
                 for ny, nx in (
                     (cy - 1, cx),
                     (cy + 1, cx),
@@ -135,12 +134,30 @@ def components(mask, min_area=1, max_area=None):
     return found
 
 
+def dilate(mask, steps=3):
+    out = mask.astype(bool).copy()
+    for _ in range(steps):
+        p = np.pad(out, 1, mode="constant", constant_values=False)
+        out = (
+            p[1:-1, 1:-1]
+            | p[:-2, 1:-1]
+            | p[2:, 1:-1]
+            | p[1:-1, :-2]
+            | p[1:-1, 2:]
+            | p[:-2, :-2]
+            | p[:-2, 2:]
+            | p[2:, :-2]
+            | p[2:, 2:]
+        )
+    return out
+
+
 def structural_measurements(image):
     """
-    Measure explainable visual features after resizing to 160x160.
+    Explainable measurements after normalising the image to 160x160.
 
     Length/width are image-relative pixels, not real centimetres.
-    HSV hue values use Pillow's 0-255 hue scale.
+    Seed counting is enabled only when a cut interior is visible.
     """
     img = image.convert("RGB").resize((160, 160), Image.Resampling.BILINEAR)
     rgb = np.asarray(img, dtype=np.uint8)
@@ -151,14 +168,15 @@ def structural_measurements(image):
     sat = hsv[:, :, 1].astype(np.float32)
     val = hsv[:, :, 2].astype(np.float32)
 
-    # Main fruit region. Fruits-360 commonly has a light/white background.
-    candidate = (sat > 32) | (val < 232)
+    # Colour-aware fruit mask. This avoids grey/white compression shadows
+    # incorrectly making the object measure as a full 150x150 square.
+    candidate = ((sat > 30) & (val > 35)) | ((val < 175) & (sat > 18))
     candidate[:5, :] = False
     candidate[-5:, :] = False
     candidate[:, :5] = False
     candidate[:, -5:] = False
-    comps = components(candidate, 80)
 
+    comps = components(candidate, 80)
     if comps:
         def comp_score(component):
             center = not (
@@ -170,55 +188,50 @@ def structural_measurements(image):
             return component["area"] * (1.8 if center else 1.0)
 
         main = max(comps, key=comp_score)
-        left = main["left"]
-        right = main["right"]
-        top = main["top"]
-        bottom = main["bottom"]
-        object_area = float(main["area"])
+        left, right = main["left"], main["right"]
+        top, bottom = main["top"], main["bottom"]
     else:
         left = top = 0
         right = bottom = 159
-        object_area = float(candidate.sum())
 
     box_width = max(1, right - left + 1)
     box_height = max(1, bottom - top + 1)
     length_px = max(box_width, box_height)
     width_px = min(box_width, box_height)
     aspect = float(length_px / max(width_px, 1))
-    fill = float(
-        min(1.0, object_area / max(float(box_width * box_height), 1.0))
-    )
 
     roi = np.zeros((160, 160), dtype=bool)
     roi[top : bottom + 1, left : right + 1] = True
-    denom = float(max(int(roi.sum()), 1))
+    fruit_mask = roi & candidate
+    fruit_pixels = float(max(int(fruit_mask.sum()), 1))
+    fill = float(min(1.0, fruit_pixels / max(float(box_width * box_height), 1.0)))
 
     red = (
-        roi
+        fruit_mask
         & (r > 120)
         & (r > g * 1.10)
         & (r > b * 1.08)
         & (sat > 50)
     )
     green = (
-        roi
+        fruit_mask
         & (g > 80)
         & (g > r * 1.03)
         & (g > b * 1.08)
         & (sat > 35)
     )
     pale = (
-        roi
+        fruit_mask
         & (r > 165)
         & (g > 145)
         & (b > 95)
         & (sat < 115)
         & (val > 155)
     )
+    light_membrane = fruit_mask & (sat < 72) & (val > 145)
 
-    # Orange peel/flesh: orange hue, strong saturation and medium/high brightness.
     orange_colour = (
-        roi
+        fruit_mask
         & (hue >= 7)
         & (hue <= 34)
         & (sat >= 80)
@@ -226,7 +239,7 @@ def structural_measurements(image):
         & (r > g * 1.02)
     )
     orange_flesh = (
-        roi
+        fruit_mask
         & (hue >= 8)
         & (hue <= 38)
         & (sat >= 35)
@@ -236,10 +249,8 @@ def structural_measurements(image):
         & (g > b * 1.10)
     )
 
-    # Lime colour: saturated yellow-green/green. It is deliberately narrower
-    # than generic "green" so green apples are not automatically called Lime.
     lime_green = (
-        roi
+        fruit_mask
         & (hue >= 42)
         & (hue <= 105)
         & (sat >= 75)
@@ -248,7 +259,7 @@ def structural_measurements(image):
         & (g > b * 1.10)
     )
     lime_flesh = (
-        roi
+        fruit_mask
         & (hue >= 35)
         & (hue <= 95)
         & (sat >= 25)
@@ -258,31 +269,56 @@ def structural_measurements(image):
         & (g > b * 1.06)
     )
 
-    # Apple seeds are usually only a few compact dark spots. A cut pomegranate
-    # often exposes many compact red/dark seed/aril-like regions.
-    dark_seed = roi & (val >= 30) & (val < 125) & (sat > 35)
-    red_aril = (
-        roi
+    red_aril_pixels = (
+        fruit_mask
         & (((hue < 14) | (hue > 238)))
         & (sat > 105)
         & (val > 75)
         & (val < 235)
     )
-    seed_candidates = components(dark_seed | red_aril, 4, 190)
+
+    pale_fraction = float(pale.sum()) / fruit_pixels
+    membrane_fraction = float(light_membrane.sum()) / fruit_pixels
+    red_aril_fraction = float(red_aril_pixels.sum()) / fruit_pixels
+
+    # Seed counting is intentionally disabled for whole fruit. This fixes the
+    # old error where bumpy lime peel was counted as 20-30+ fake seeds.
+    seed_analysis_valid = (
+        pale_fraction >= 0.06
+        or (membrane_fraction >= 0.035 and red_aril_fraction >= 0.08)
+    )
 
     seed_count = 0
-    for component in seed_candidates:
-        component_width = component["right"] - component["left"] + 1
-        component_height = component["bottom"] - component["top"] + 1
-        component_aspect = max(component_width, component_height) / max(
-            1, min(component_width, component_height)
-        )
-        if (
-            component_width <= 24
-            and component_height <= 24
-            and component_aspect <= 3.0
-        ):
-            seed_count += 1
+    if seed_analysis_valid:
+        seed_region = dilate(pale | light_membrane, steps=4) & roi
+        dark_seed = seed_region & (val >= 22) & (val < 125) & (sat > 24)
+        red_aril = seed_region & red_aril_pixels
+        seed_candidates = components(dark_seed | red_aril, 4, 190)
+
+        for component in seed_candidates:
+            cw = component["right"] - component["left"] + 1
+            ch = component["bottom"] - component["top"] + 1
+            component_aspect = max(cw, ch) / max(1, min(cw, ch))
+            if cw <= 24 and ch <= 24 and component_aspect <= 3.0:
+                seed_count += 1
+
+    # End taper gives extra support to oval/pointed citrus such as lime.
+    local = fruit_mask[top : bottom + 1, left : right + 1]
+    if box_width >= box_height:
+        profile = local.sum(axis=0).astype(np.float32)
+    else:
+        profile = local.sum(axis=1).astype(np.float32)
+
+    n = len(profile)
+    edge_n = max(1, int(n * 0.16))
+    mid_start = max(0, int(n * 0.40))
+    mid_end = min(n, max(mid_start + 1, int(n * 0.60)))
+    edge_mean = float(np.mean(np.concatenate([profile[:edge_n], profile[-edge_n:]])))
+    middle_mean = float(np.mean(profile[mid_start:mid_end]))
+    taper_score = float(np.clip(1.0 - edge_mean / max(middle_mean, 1e-6), 0.0, 1.0))
+
+    mean_saturation = float(sat[fruit_mask].mean()) if fruit_mask.any() else 0.0
+    mean_value = float(val[fruit_mask].mean()) if fruit_mask.any() else 0.0
 
     return {
         "length_px": int(length_px),
@@ -290,169 +326,178 @@ def structural_measurements(image):
         "aspect_ratio": aspect,
         "fill_ratio": fill,
         "seed_count": int(seed_count),
-        "red_fraction": float(red.sum()) / denom,
-        "green_fraction": float(green.sum()) / denom,
-        "pale_flesh_fraction": float(pale.sum()) / denom,
-        "orange_fraction": float(orange_colour.sum()) / denom,
-        "orange_flesh_fraction": float(orange_flesh.sum()) / denom,
-        "lime_green_fraction": float(lime_green.sum()) / denom,
-        "lime_flesh_fraction": float(lime_flesh.sum()) / denom,
-        "mean_saturation": (
-            float(sat[roi].mean()) if roi.any() else 0.0
-        ),
+        "seed_analysis_valid": bool(seed_analysis_valid),
+        "red_fraction": float(red.sum()) / fruit_pixels,
+        "green_fraction": float(green.sum()) / fruit_pixels,
+        "pale_flesh_fraction": pale_fraction,
+        "orange_fraction": float(orange_colour.sum()) / fruit_pixels,
+        "orange_flesh_fraction": float(orange_flesh.sum()) / fruit_pixels,
+        "lime_green_fraction": float(lime_green.sum()) / fruit_pixels,
+        "lime_flesh_fraction": float(lime_flesh.sum()) / fruit_pixels,
+        "lime_hue_purity": float(lime_green.sum()) / fruit_pixels,
+        "orange_hue_purity": float(orange_colour.sum()) / fruit_pixels,
+        "mean_saturation": mean_saturation,
+        "mean_value": mean_value,
+        "taper_score": taper_score,
     }
 
 
 def apply_structure_rules(probabilities, image):
     p = probabilities.astype(np.float32).copy()
-    measurements = structural_measurements(image)
+    m = structural_measurements(image)
 
-    seeds = int(measurements["seed_count"])
-    aspect = float(measurements["aspect_ratio"])
-    fill = float(measurements["fill_ratio"])
-    pale = float(measurements["pale_flesh_fraction"])
-    red = float(measurements["red_fraction"])
-    green = float(measurements["green_fraction"])
-    orange_area = float(measurements["orange_fraction"])
-    orange_flesh = float(measurements["orange_flesh_fraction"])
-    lime_green = float(measurements["lime_green_fraction"])
-    lime_flesh = float(measurements["lime_flesh_fraction"])
-    mean_saturation = float(measurements["mean_saturation"])
+    seeds = int(m["seed_count"])
+    seed_valid = bool(m["seed_analysis_valid"])
+    aspect = float(m["aspect_ratio"])
+    fill = float(m["fill_ratio"])
+    pale = float(m["pale_flesh_fraction"])
+    red = float(m["red_fraction"])
+    green = float(m["green_fraction"])
+    orange_area = float(m["orange_fraction"])
+    orange_flesh = float(m["orange_flesh_fraction"])
+    lime_green = float(m["lime_green_fraction"])
+    lime_flesh = float(m["lime_flesh_fraction"])
+    lime_purity = float(m["lime_hue_purity"])
+    orange_purity = float(m["orange_hue_purity"])
+    mean_sat = float(m["mean_saturation"])
+    taper = float(m["taper_score"])
     reasons = []
 
-    # Pomegranate: many visible seeds/arils together with a red interior.
-    if seeds >= 12 and red >= 0.10:
-        p[POMEGRANATE] *= 5.0
-        p[APPLE] *= 0.35
-        p[GUAVA] *= 0.70
-        reasons.append(f"many seed-like regions ({seeds})")
-    elif seeds >= 8 and red >= 0.06:
-        p[POMEGRANATE] *= 2.8
-        p[APPLE] *= 0.65
-        reasons.append(f"several seed-like regions ({seeds})")
+    if seed_valid and seeds >= 12 and red >= 0.10:
+        p[POMEGRANATE] *= 5.5
+        p[APPLE] *= 0.30
+        p[GUAVA] *= 0.65
+        reasons.append(f"many visible seed/aril regions ({seeds})")
+    elif seed_valid and seeds >= 8 and red >= 0.06:
+        p[POMEGRANATE] *= 3.0
+        p[APPLE] *= 0.60
+        reasons.append(f"several visible seed/aril regions ({seeds})")
 
-    # Apple: neutral pale cut flesh + only a few seeds + red/green peel.
-    # Do not fire this rule when the flesh itself looks strongly citrus-coloured.
     if (
-        seeds <= 6
+        seed_valid
+        and seeds <= 6
         and pale >= 0.16
         and (green >= 0.06 or red >= 0.06)
         and lime_flesh < 0.14
         and orange_flesh < 0.16
     ):
-        p[APPLE] *= 4.2
-        p[POMEGRANATE] *= 0.32
-        p[GUAVA] *= 0.55
+        p[APPLE] *= 4.5
+        p[POMEGRANATE] *= 0.30
+        p[GUAVA] *= 0.52
         p[LIME] *= 0.55
-        reasons.append(f"pale flesh with only {seeds} seed-like spots")
+        reasons.append(f"pale flesh with only {seeds} visible seed-like spots")
 
-    # Banana: clearly elongated silhouette.
     if aspect >= 1.55:
-        p[BANANA] *= 3.0
-        p[LIME] *= 0.70
-        p[ORANGE] *= 0.70
-        p[POMEGRANATE] *= 0.70
+        p[BANANA] *= 3.2
+        p[LIME] *= 0.72
+        p[ORANGE] *= 0.72
+        p[POMEGRANATE] *= 0.72
         reasons.append(f"elongated shape L/W={aspect:.2f}")
     elif aspect >= 1.35:
-        p[BANANA] *= 1.6
+        p[BANANA] *= 1.7
 
-    # Orange: round/compact shape plus a large orange-colour region.
-    # The base classifier must still have some Orange support for the strongest rule.
+    # Strong orange hue is allowed to override a weak base classifier.
     if (
-        aspect <= 1.28
-        and fill >= 0.42
-        and orange_area >= 0.24
-        and mean_saturation >= 85
-        and probabilities[ORANGE] >= 0.06
-    ):
-        p[ORANGE] *= 4.5
-        p[APPLE] *= 0.62
-        p[LIME] *= 0.45
-        p[GUAVA] *= 0.72
-        reasons.append(
-            f"round shape + orange colour ({orange_area * 100:.0f}% area)"
-        )
-    elif (
-        aspect <= 1.33
-        and orange_area >= 0.14
-        and probabilities[ORANGE] >= 0.10
-    ):
-        p[ORANGE] *= 2.2
-        reasons.append(
-            f"orange-colour support ({orange_area * 100:.0f}% area)"
-        )
-
-    # Cut orange: orange-coloured flesh can support Orange even if peel is
-    # partly outside the crop.
-    if (
-        aspect <= 1.38
-        and orange_flesh >= 0.20
-        and probabilities[ORANGE] >= 0.05
-    ):
-        p[ORANGE] *= 2.0
-        p[LIME] *= 0.72
-        reasons.append(
-            f"orange-coloured flesh ({orange_flesh * 100:.0f}% area)"
-        )
-
-    # Lime: usually round/compact with a strong saturated yellow-green/green area.
-    # Require low neutral-pale flesh for a whole-lime rule so a green apple is
-    # less likely to be forced into Lime.
-    if (
-        aspect <= 1.28
+        aspect <= 1.45
         and fill >= 0.40
-        and lime_green >= 0.28
-        and pale < 0.12
-        and orange_area < 0.08
-        and mean_saturation >= 90
-        and probabilities[LIME] >= 0.06
+        and orange_purity >= 0.62
+        and mean_sat >= 145
+        and lime_green < 0.10
     ):
-        p[LIME] *= 4.2
-        p[APPLE] *= 0.55
-        p[GUAVA] *= 0.70
-        p[ORANGE] *= 0.48
+        p[ORANGE] *= 24.0
+        p[GUAVA] *= 0.18
+        p[APPLE] *= 0.40
+        p[LIME] *= 0.22
         reasons.append(
-            f"round shape + saturated lime-green ({lime_green * 100:.0f}% area)"
+            f"strong orange peel signature ({orange_purity * 100:.0f}% orange pixels)"
         )
     elif (
-        aspect <= 1.33
-        and lime_green >= 0.18
-        and pale < 0.10
-        and probabilities[LIME] >= 0.10
+        aspect <= 1.45
+        and orange_area >= 0.24
+        and mean_sat >= 105
+        and probabilities[ORANGE] >= 0.03
     ):
-        p[LIME] *= 2.0
-        reasons.append(
-            f"lime-green colour support ({lime_green * 100:.0f}% area)"
-        )
+        p[ORANGE] *= 6.0
+        p[GUAVA] *= 0.55
+        reasons.append(f"orange-colour support ({orange_area * 100:.0f}% area)")
 
-    # Cut lime: green-tinted citrus flesh + green peel is a useful cue.
     if (
-        aspect <= 1.38
+        aspect <= 1.45
+        and orange_flesh >= 0.20
+        and probabilities[ORANGE] >= 0.03
+    ):
+        p[ORANGE] *= 2.4
+        p[LIME] *= 0.72
+        reasons.append(f"orange-coloured flesh ({orange_flesh * 100:.0f}% area)")
+
+    # Strong whole-lime signature can override Guava even when the saved model
+    # gives Lime a very small starting probability.
+    whole_lime_signature = (
+        aspect <= 1.50
+        and fill >= 0.40
+        and lime_purity >= 0.70
+        and pale < 0.08
+        and orange_area < 0.06
+        and mean_sat >= 150
+    )
+    if whole_lime_signature:
+        p[LIME] *= 32.0
+        p[GUAVA] *= 0.10
+        p[APPLE] *= 0.42
+        p[ORANGE] *= 0.35
+        reasons.append(
+            f"strong lime peel signature ({lime_purity * 100:.0f}% lime-green pixels, "
+            f"saturation {mean_sat:.0f}/255)"
+        )
+    elif (
+        aspect <= 1.50
+        and fill >= 0.36
+        and lime_purity >= 0.48
+        and pale < 0.10
+        and mean_sat >= 120
+        and probabilities[LIME] >= 0.02
+    ):
+        p[LIME] *= 9.0
+        p[GUAVA] *= 0.42
+        p[APPLE] *= 0.72
+        reasons.append(f"lime-green colour support ({lime_purity * 100:.0f}% area)")
+
+    if (
+        lime_purity >= 0.55
+        and mean_sat >= 130
+        and taper >= 0.18
+        and aspect <= 1.55
+    ):
+        p[LIME] *= 1.8
+        p[GUAVA] *= 0.78
+        reasons.append(f"tapered citrus shape ({taper * 100:.0f}% taper)")
+
+    if (
+        aspect <= 1.45
         and lime_flesh >= 0.16
         and lime_green >= 0.06
-        and probabilities[LIME] >= 0.05
+        and probabilities[LIME] >= 0.03
     ):
-        p[LIME] *= 2.3
-        p[APPLE] *= 0.60
-        p[ORANGE] *= 0.75
-        reasons.append(
-            f"green citrus flesh ({lime_flesh * 100:.0f}% area)"
-        )
+        p[LIME] *= 2.5
+        p[APPLE] *= 0.58
+        p[ORANGE] *= 0.72
+        reasons.append(f"green citrus flesh ({lime_flesh * 100:.0f}% area)")
 
-    # Gentle support for whole green apple; green alone is not decisive.
+    # Green apple support is disabled when a very strong saturated lime peel
+    # signature is present.
     if (
-        seeds <= 6
-        and pale >= 0.08
+        pale >= 0.08
         and green >= 0.18
-        and lime_flesh < 0.12
-        and aspect < 1.35
+        and lime_purity < 0.55
+        and mean_sat < 150
+        and aspect < 1.40
     ):
-        p[APPLE] *= 1.7
+        p[APPLE] *= 1.8
         p[GUAVA] *= 0.82
-        p[LIME] *= 0.82
+        p[LIME] *= 0.78
 
     p /= p.sum() + 1e-8
-    return p, "; ".join(reasons), measurements
+    return p, "; ".join(reasons), m
 
 
 def image_quality(image):
@@ -535,11 +580,13 @@ def show_measurements(measurements):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Length", f"{int(measurements['length_px'])} px")
         c2.metric("Width", f"{int(measurements['width_px'])} px")
-        c3.metric(
-            "Length / Width",
-            f"{float(measurements['aspect_ratio']):.2f}",
+        c3.metric("Length / Width", f"{float(measurements['aspect_ratio']):.2f}")
+        seed_text = (
+            str(int(measurements["seed_count"]))
+            if measurements["seed_analysis_valid"]
+            else "N/A"
         )
-        c4.metric("Seed-like spots", str(int(measurements["seed_count"])))
+        c4.metric("Seed-like spots", seed_text)
 
         st.write(
             f"**Pale flesh:** {float(measurements['pale_flesh_fraction']) * 100:.1f}%  ·  "
@@ -548,18 +595,16 @@ def show_measurements(measurements):
         )
         st.write(
             f"**Orange area:** {float(measurements['orange_fraction']) * 100:.1f}%  ·  "
-            f"**Orange flesh:** {float(measurements['orange_flesh_fraction']) * 100:.1f}%  ·  "
             f"**Lime-green area:** {float(measurements['lime_green_fraction']) * 100:.1f}%  ·  "
-            f"**Lime flesh:** {float(measurements['lime_flesh_fraction']) * 100:.1f}%"
+            f"**Mean saturation:** {float(measurements['mean_saturation']):.0f}/255"
         )
         st.write(
             f"**Shape fill:** {float(measurements['fill_ratio']) * 100:.1f}%  ·  "
-            f"**Mean saturation:** {float(measurements['mean_saturation']):.0f}/255"
+            f"**Citrus taper:** {float(measurements['taper_score']) * 100:.1f}%"
         )
         st.caption(
-            "Length/width are measured after normalising to 160×160 pixels, "
-            "so they describe image shape rather than real centimetres. "
-            "Seed counting works best when the cut interior is visible."
+            "Seed counting is disabled for whole fruit because peel texture can look like seeds. "
+            "Length/width are measured after normalising to 160×160 pixels."
         )
 
 
@@ -580,12 +625,8 @@ def show_result(image):
         if result["reason"]:
             st.caption("Algorithm: " + result["reason"])
 
-        st.metric(
-            "Prediction confidence",
-            f"{result['confidence'] * 100:.1f}%",
-        )
+        st.metric("Prediction confidence", f"{result['confidence'] * 100:.1f}%")
         st.subheader("Top 3 predictions")
-
         for index in np.argsort(probabilities)[::-1][:3]:
             score = float(probabilities[int(index)])
             st.write(f"**{CLASSES[int(index)]}** — {score * 100:.1f}%")
@@ -612,10 +653,7 @@ def video_frame_callback(frame):
     roi = image.crop((left, top, right, bottom))
     now = time.monotonic()
 
-    if (
-        now - float(LIVE_STATE["last_time"]) >= 0.28
-        and LIVE_LOCK.acquire(False)
-    ):
+    if now - float(LIVE_STATE["last_time"]) >= 0.28 and LIVE_LOCK.acquire(False):
         try:
             LIVE_STATE["result"] = predict_one(roi)
             LIVE_STATE["last_time"] = now
@@ -626,26 +664,24 @@ def video_frame_callback(frame):
             LIVE_LOCK.release()
 
     result = LIVE_STATE["result"]
-
     if result is None or len(LIVE_HISTORY) < 3:
         label = "Analyzing fruit..."
     else:
         recent = list(LIVE_HISTORY)[-8:]
         known = [item for item in recent if item["known"]]
-
         if len(known) >= 3:
-            index = Counter(
-                item["index"] for item in known
-            ).most_common(1)[0][0]
+            index = Counter(item["index"] for item in known).most_common(1)[0][0]
             matching = [item for item in known if item["index"] == index]
-            confidence = float(
-                np.mean([item["confidence"] for item in matching[-5:]])
-            )
+            confidence = float(np.mean([item["confidence"] for item in matching[-5:]]))
             measurements = matching[-1]["measurements"]
+            seed_text = (
+                str(int(measurements["seed_count"]))
+                if measurements["seed_analysis_valid"]
+                else "N/A"
+            )
             label = (
                 f"{CLASSES[index]} — {confidence * 100:.1f}%  "
-                f"L/W {float(measurements['aspect_ratio']):.2f}  "
-                f"Seeds {int(measurements['seed_count'])}"
+                f"L/W {float(measurements['aspect_ratio']):.2f}  Seeds {seed_text}"
             )
         else:
             label = (
@@ -654,60 +690,40 @@ def video_frame_callback(frame):
             )
 
     draw = ImageDraw.Draw(image)
-    draw.rectangle(
-        (left, top, right, bottom),
-        outline=(40, 220, 90),
-        width=5,
-    )
-    draw.rounded_rectangle(
-        (12, 12, max(360, width - 12), 68),
-        radius=12,
-        fill=(0, 0, 0),
-    )
+    draw.rectangle((left, top, right, bottom), outline=(40, 220, 90), width=5)
+    draw.rounded_rectangle((12, 12, max(360, width - 12), 68), radius=12, fill=(0, 0, 0))
     draw.text((24, 31), label, fill=(255, 255, 255))
 
     guide_top = max(top, bottom - 38)
-    draw.rectangle(
-        (left, guide_top, right, bottom),
-        fill=(0, 0, 0),
-    )
+    draw.rectangle((left, guide_top, right, bottom), fill=(0, 0, 0))
     draw.text(
         (left + 10, guide_top + 10),
         "Place ONE fruit inside the green box",
         fill=(255, 255, 255),
     )
-
-    return av.VideoFrame.from_ndarray(
-        np.asarray(image),
-        format="rgb24",
-    )
+    return av.VideoFrame.from_ndarray(np.asarray(image), format="rgb24")
 
 
 st.title("🍎 Fruit Image Detection")
-st.caption(
-    "Live front camera + upload image with seed, shape and citrus-colour analysis."
-)
+st.caption("Live front camera + upload image with seed, shape and citrus-colour analysis.")
 st.info(
     "The detector combines the saved model with explainable rules. "
-    "**Pomegranate:** many visible seed-like regions. "
-    "**Apple:** pale flesh with only a few seeds. "
-    "**Banana:** length is much larger than width. "
-    "**Orange:** round shape + orange colour/flesh. "
-    "**Lime:** round shape + saturated lime-green colour or green citrus flesh."
+    "**Pomegranate:** visible cut seeds/arils. "
+    "**Apple:** pale cut flesh with only a few seeds. "
+    "**Banana:** high length/width ratio. "
+    "**Orange:** saturated orange peel/flesh. "
+    "**Lime:** highly saturated lime-green peel + compact/tapered citrus shape."
 )
 
-camera_tab, upload_tab = st.tabs(
-    ["🎥 Live Front Camera", "🖼️ Upload Image"]
-)
+camera_tab, upload_tab = st.tabs(["🎥 Live Front Camera", "🖼️ Upload Image"])
 
 with camera_tab:
     st.subheader("Live Front Camera")
     st.write(
-        "Press **START**, allow camera permission, and place one fruit inside "
-        "the green box. For seed/flesh analysis, show the cut interior when possible."
+        "Press **START**, allow camera permission, and place one fruit inside the green box."
     )
     webrtc_streamer(
-        key="fruit-live-structure-v2",
+        key="fruit-live-structure-v3",
         video_frame_callback=video_frame_callback,
         media_stream_constraints={
             "video": {
@@ -733,7 +749,7 @@ with camera_tab:
         async_processing=True,
     )
     st.caption(
-        "Live label shows L/W (length-to-width ratio) and estimated seed-like spots."
+        "Seed count shows N/A for whole fruit; it is only enabled when a cut interior is visible."
     )
 
 with upload_tab:
@@ -741,13 +757,12 @@ with upload_tab:
     uploaded = st.file_uploader(
         "Choose JPG, JPEG, PNG or WEBP",
         type=["jpg", "jpeg", "png", "webp"],
-        key="fruit-structure-upload-v2",
+        key="fruit-structure-upload-v3",
     )
     if uploaded is not None:
         show_result(Image.open(uploaded).convert("RGB"))
 
 st.divider()
 st.caption(
-    "Rule-assisted fruit recognition. Measurements are image-relative, "
-    "not physical centimetres."
+    "Rule-assisted fruit recognition. Measurements are image-relative, not physical centimetres."
 )
